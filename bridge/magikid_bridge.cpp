@@ -9,6 +9,9 @@
 //   * emits one compact JSON state object per tick on STDOUT (newline-delimited)
 //   * reads newline-delimited JSON COMMANDS on STDIN.
 //
+// Commands also include a streamed "teleop" target (Meta Quest, ~30 Hz) with a
+// watchdog: if frames stop for TELEOP_TIMEOUT_S the arms hold where they are.
+//
 // ARM CONTROL (R1-A upper body): the R1-A is driven at LOW LEVEL over rt/lowcmd
 // (12 joints: both arms + head; the arm_sdk blend path needs a high-level
 // controller this unit doesn't run). This mirrors the official
@@ -24,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -138,6 +142,10 @@ struct ArmControl {
     std::array<float, ARM_N> traj_from{};   // start pose of current segment
     size_t traj_seg = 0;
     double traj_t = 0, traj_total = 0, traj_elapsed = 0;
+    // Quest teleop stream: live while frames with a non-zero mask keep coming.
+    bool teleop_live = false;
+    float teleop_vel = 0.5f;                // rad/s cap requested by the headset
+    std::chrono::steady_clock::time_point teleop_last{};
 };
 // Head yaw is NEVER commanded: its reading is offset by ~100+ deg when the head
 // faces forward, and the offset changes between power-ons (seen 2.007, 1.738,
@@ -148,6 +156,9 @@ static const bool HEAD_YAW_ENABLED = false;
 // Hard velocity cap while a scripted motion plays (planned peak is lower).
 static const float TRAJ_MAX_VEL = 1.0f;
 static const int TRAJ_MAX_SEG = 64;
+// Quest teleop: hard velocity cap and how long without frames before we hold.
+static const float TELEOP_MAX_VEL = 1.0f;
+static const double TELEOP_TIMEOUT_S = 0.3;
 static ArmControl g_arm;
 
 static ChannelPublisherPtr<LowCmd_> g_lowcmd;
@@ -222,7 +233,9 @@ static std::string buildStateJson() {
       os << "\"traj_active\":" << (g_arm.traj_active ? "true" : "false") << ',';
       os << "\"traj_name\":\"" << g_arm.traj_name << "\",";
       char b[32]; snprintf(b, sizeof(b), "%.3f", g_arm.traj_total > 0 ? g_arm.traj_elapsed / g_arm.traj_total : 0.0);
-      os << "\"traj_prog\":" << b << ','; }
+      os << "\"traj_prog\":" << b << ',';
+      os << "\"teleop_live\":" << (g_arm.teleop_live ? "true" : "false") << ',';
+      appendFloatArray(os, "q_cmd", g_arm.q_cmd.data(), ARM_N); os << ','; }
     os << "\"head_yaw_enabled\":" << (HEAD_YAW_ENABLED ? "true" : "false") << ',';
     appendFloatArray(os, "q", s.q.data(), R1_NUM_MOTOR); os << ',';
     appendFloatArray(os, "dq", s.dq.data(), R1_NUM_MOTOR); os << ',';
@@ -243,6 +256,17 @@ static std::string buildStateJson() {
 static void logJson(const std::string &msg) {
     // one write per line so it can't interleave with the state stream
     std::cout << ("{\"type\":\"log\",\"msg\":\"" + msg + "\"}\n") << std::flush;
+}
+
+// Same as logJson but at most once per 2 s (for warnings about a 30 Hz stream).
+static void logThrottled(const std::string &msg) {
+    static std::mutex m;
+    static std::chrono::steady_clock::time_point last{};
+    std::lock_guard<std::mutex> l(m);
+    auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2)) return;
+    last = now;
+    logJson(msg);
 }
 
 // ---- tiny JSON scrapers (fixed schema) -------------------------------------
@@ -310,6 +334,7 @@ static void armEngage() {
             g_arm.q_cmd[i] = g_arm.q_target[i] = g_state.q[ARM_STATE_IDX[i]];
         g_arm.have_target = true;
         trajStopLocked();
+        g_arm.teleop_live = false;
     }
     g_arm.engaged.store(true);
     logJson(HEAD_YAW_ENABLED ? "arm control ENGAGED (low-level rt/lowcmd, holding current pose)"
@@ -317,7 +342,7 @@ static void armEngage() {
 }
 
 static void armRelease() {
-    { std::lock_guard<std::mutex> l(g_arm.m); trajStopLocked(); }
+    { std::lock_guard<std::mutex> l(g_arm.m); trajStopLocked(); g_arm.teleop_live = false; }
     if (!g_arm.engaged.load()) return;
     g_arm.engaged.store(false);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -347,6 +372,7 @@ static void handleCommand(const std::string &line) {
         if (jsonFindFloatArray(line, "q", q) && (int)q.size() == ARM_N) {
             { std::lock_guard<std::mutex> l(g_arm.m);
               if (g_arm.traj_active) { trajStopLocked(); logJson("motion interrupted by manual targets"); }
+              g_arm.teleop_live = false;      // manual targets take over from the headset
               for (int i = 0; i < ARM_N; ++i)
                   g_arm.q_target[i] = std::max(ARM_MIN[i], std::min(ARM_MAX[i], q[i]));
               g_arm.have_target = true; }
@@ -369,6 +395,7 @@ static void handleCommand(const std::string &line) {
         }
         std::lock_guard<std::mutex> l(g_arm.m);
         trajStopLocked();
+        g_arm.teleop_live = false;          // headset frames are ignored while it plays
         g_arm.traj_name = name;
         for (size_t s = 0; s < dur.size(); ++s) {
             std::array<float, ARM_N> p;
@@ -384,6 +411,36 @@ static void handleCommand(const std::string &line) {
         char buf[96]; snprintf(buf, sizeof(buf), "motion '%s' started (%d segments, %.1f s)",
                                name.c_str(), (int)dur.size(), g_arm.traj_total);
         logJson(buf);
+    } else if (type == "teleop") {
+        // {"type":"teleop","q":[12],"mask":[left,right,head],"vel":rad/s}
+        // Streamed by the Quest page. Only masked groups are applied; head yaw never.
+        std::vector<float> q, mask; double vel = 0.5;
+        jsonFindNumber(line, "vel", vel);
+        if (!jsonFindFloatArray(line, "q", q) || (int)q.size() != ARM_N ||
+            !jsonFindFloatArray(line, "mask", mask) || mask.size() != 3) {
+            logThrottled("teleop frame ignored: bad format"); return;
+        }
+        if (!g_arm.engaged.load()) { logThrottled("teleop ignored: engage the arms from the dashboard first"); return; }
+        std::lock_guard<std::mutex> l(g_arm.m);
+        if (g_arm.traj_active) { logThrottled("teleop ignored while a motion plays"); return; }
+        g_arm.teleop_last = std::chrono::steady_clock::now();
+        bool any = mask[0] > 0.5f || mask[1] > 0.5f || mask[2] > 0.5f;
+        if (!any) return;                   // heartbeat: keeps the watchdog fed
+        g_arm.teleop_vel = (float)std::max(0.05, std::min((double)TELEOP_MAX_VEL, vel));
+        if (!g_arm.teleop_live) { g_arm.teleop_live = true; logJson("Quest teleop live"); }
+        for (int i = 0; i < ARM_N; ++i) {
+            int grp = i < 5 ? 0 : (i < 10 ? 1 : 2);
+            if (mask[grp] < 0.5f || i == HEAD_YAW_K) continue;
+            g_arm.q_target[i] = std::max(ARM_MIN[i], std::min(ARM_MAX[i], q[i]));
+        }
+    } else if (type == "teleop_stop") {
+        std::lock_guard<std::mutex> l(g_arm.m);
+        bool was = g_arm.teleop_live;
+        g_arm.teleop_live = false;
+        if (g_arm.engaged.load() && !g_arm.traj_active) {
+            g_arm.q_target = g_arm.q_cmd;   // freeze where we are
+            if (was) logJson("Quest teleop stopped, holding pose");
+        }
     } else if (type == "traj_stop") {
         std::lock_guard<std::mutex> l(g_arm.m);
         if (g_arm.traj_active) {
@@ -434,8 +491,17 @@ static void armControlThread() {
             {
                 std::lock_guard<std::mutex> l(g_arm.m);
                 trajStepLocked(dt);
-                float step = (g_arm.traj_active ? TRAJ_MAX_VEL
-                              : (g_arm.max_vel > 0 ? g_arm.max_vel : step_default)) * (float)dt;
+                // teleop watchdog: headset/network gone -> hold the current pose
+                if (g_arm.teleop_live && std::chrono::steady_clock::now() - g_arm.teleop_last >
+                                         std::chrono::duration<double>(TELEOP_TIMEOUT_S)) {
+                    g_arm.teleop_live = false;
+                    g_arm.q_target = g_arm.q_cmd;
+                    logJson("Quest teleop: no frames for 0.3 s, holding pose");
+                }
+                float vmax = g_arm.traj_active ? TRAJ_MAX_VEL
+                           : g_arm.teleop_live ? g_arm.teleop_vel
+                           : (g_arm.max_vel > 0 ? g_arm.max_vel : step_default);
+                float step = vmax * (float)dt;
                 for (int i = 0; i < ARM_N; ++i) {
                     // head yaw disabled: leave the slot at mode 0 / zero gains
                     if (!HEAD_YAW_ENABLED && i == HEAD_YAW_K) continue;

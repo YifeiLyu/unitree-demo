@@ -33,8 +33,10 @@ This repo is the source. The deployed copy lives **on the robot** at
 `~/magikid_teleop/`. Nothing here runs on the dev machine except syntax checks.
 
 ```bash
-# deploy (from repo root): never sync bridge/build, it is built on the robot
+# deploy (from repo root): never sync bridge/build (built on the robot) or the
+# robot's own certs/ + teleop_key (generated there on first start)
 rsync -av --exclude .git --exclude bridge/build --exclude __pycache__ \
+  --exclude certs --exclude teleop_key \
   ./ unitree@192.168.123.164:~/magikid_teleop/
 
 # run on the robot
@@ -58,29 +60,39 @@ The robot's clock is wrong (it reads 2024), so after a copy `make` can decide a
 new `.cpp` is up to date and skip it. **Always `make clean` after deploying
 bridge changes**, then check the binary with `strings`.
 
-### Checks you can run locally
+### Checks you can run locally (no robot needed)
 
 ```bash
-node --check web/app.js && node --check web/model3d.js
-python3 -m py_compile server.py
+for f in web/*.js; do node --check "$f"; done && python3 -m py_compile server.py
+node tests/test_teleop.js        # IK, collision check, Quest mapping
+node tests/test_quest_page.js    # quest.js against a mock WebXR session
+python3 tests/test_server.py     # server.py + tests/fake_bridge.py: listeners, key, whitelists
 ```
+
+The C++ bridge needs the robot's SDK headers. To syntax-check it without
+writing anything on the robot, pipe it to the robot's compiler:
+`ssh unitree@192.168.123.164 'g++ -std=c++17 -fsyntax-only -Wall -x c++ -I/usr/local/include -I/usr/local/include/ddscxx -I/usr/local/include/iceoryx/v2.0.2 -' < bridge/magikid_bridge.cpp`
 
 ## Architecture
 
 ```
 browser ──HTTP / WS──► server.py (tornado :8080) ──stdin/stdout JSON lines──► bridge/build/magikid_bridge eth10 50
-   ▲                       │                                                     │ unitree_sdk2 / CycloneDDS on eth10
+   ▲                       │  + HTTPS :8443 (Quest)                              │ unitree_sdk2 / CycloneDDS on eth10
    └──── MJPEG /cam/N ◄────┘ cv2 + V4L2                                          ├─ sub rt/lowstate       (hg LowState_)
                                                                                  ├─ sub rt/secondary_imu  (torso IMU)
-                                                                                 └─ pub rt/lowcmd 200 Hz  (hg LowCmd_, only while engaged)
+Quest 3S ──Wi-Fi──► Mac :8443 ──ssh -L──► robot :8443                            └─ pub rt/lowcmd 200 Hz  (hg LowCmd_, only while engaged)
 ```
 
 | Path | Role |
 |---|---|
-| `server.py` | tornado app. Routes: `/` (index), `/ws` (state broadcast + commands), `/cam/N` (MJPEG), `/api/meta` (camera list), static `web/`. Spawns and owns the bridge process. `scan_cameras()` auto-detects capture nodes through `/dev/v4l/by-id/*index0` and labels them head (RealSense) or gripper (JR0001/JR0002). |
+| `server.py` | tornado app. Routes: `/` (index), `/ws` (state broadcast + commands), `/cam/N` (MJPEG), `/api/meta` (camera list), static `web/`. Spawns and owns the bridge process. `scan_cameras()` auto-detects capture nodes through `/dev/v4l/by-id/*index0` and labels them head (RealSense) or gripper (JR0001/JR0002). Also runs a second, HTTPS listener for the Quest (see below). |
 | `bridge/magikid_bridge.cpp` | The only DDS process. Streams `{"type":"state",...}` at the given rate (50 Hz) and `{"type":"log","msg":...}` lines on stdout. Reads commands from stdin. Owns arm control and trajectory playback. |
 | `web/index.html`, `style.css` | Single-page dashboard: Arm Pose, Cameras, Body IMU, Joints, Arm Command (with the Motions box). |
-| `web/app.js` | All client logic: WS client, joint tables, command sliders, SVG FK fallback (`KIN`/`computeFK`), scripted motions (`buildMotion`, `checkMotion`, preview). |
+| `web/kin.js` | Shared kinematics, loaded before `app.js` and `quest.js`: `IDX`, `ARM_CMD_IDX`, `KIN` (URDF chain), `computeFK`, plus `solveArmIK` (damped least squares on the 4 position joints) and `checkPose` (self-collision limits in `BODY`). Plain globals, also `require`-able from Node. |
+| `web/app.js` | Dashboard logic: WS client, joint tables, command sliders, SVG skeleton fallback, scripted motions (`buildMotion`, `checkMotion`, preview). |
+| `web/quest.html`, `quest.js`, `teleop.js` | Meta Quest teleop page. `teleop.js` holds the pure mapping math (`TeleopCore`), `quest.js` the WebXR / three.js / WebSocket glue. |
+| `scripts/quest_tunnel.sh` | Run on the Mac: relays the robot's :8443 onto the Mac's Wi-Fi and prints the Quest URL with its key. |
+| `tests/` | Node and Python tests that run without the robot. `fake_bridge.py` speaks the bridge's stdin/stdout protocol. |
 | `web/model3d.js` | `window.Arm3D`: three.js r128 viewer that loads the 14 STL meshes into the URDF kinematic tree. If three.js or the meshes fail to load, `app.js` keeps the SVG stick figure. |
 | `web/vendor/` | three.js r128 + `STLLoader` + `OrbitControls` (classic globals, self-hosted). |
 | `web/model/meshes/` | r1_a5 STL meshes (from `unitreerobotics/unitree_ros`, `robots/r1_a5_description`). |
@@ -88,9 +100,10 @@ browser ──HTTP / WS──► server.py (tornado :8080) ──stdin/stdout JS
 
 ### WebSocket / bridge command protocol
 
-`server.py` forwards a browser message **only if its `type` is on the whitelist
-in `StateWSHandler.on_message`**. If you add a bridge command, add it there too,
-or it is silently dropped.
+`server.py` forwards a browser message **only if its `type` is on that
+listener's whitelist**: `DASHBOARD_CMDS` for :8080, `QUEST_CMDS` for :8443
+(top of `server.py`). If you add a bridge command, add it there too, or it is
+silently dropped.
 
 | `type` | Payload | Effect |
 |---|---|---|
@@ -100,10 +113,13 @@ or it is silently dropped.
 | `arm_set` | `q`: 12 floats | Manual targets, clamped to URDF limits. Cancels a running motion. |
 | `traj` | `name`, `dur`: [s…], `q`: 12×N floats | Scripted motion. Segments are cosine-eased from the current `q_cmd`. Max 64 segments, 0.2–30 s each, 1.0 rad/s hard cap. Rejected unless engaged. |
 | `traj_stop` | none | Stops the motion and holds the current pose. |
+| `teleop` | `q`: 12 floats, `mask`: [left, right, head], `vel` rad/s | Quest stream (~30 Hz). Applies only the masked groups, never head yaw, clamped to URDF limits. Velocity cap is `vel`, clamped to 0.05–1.0. An all-zero mask is a heartbeat. Ignored unless engaged, and while a `traj` plays. If no frame arrives for 0.3 s while live, the bridge holds the current pose. |
+| `teleop_stop` | none | Ends teleop and holds the current pose (the headset's FREEZE). |
 | `loco` | — | **Legacy, ignored by the bridge.** Still on the whitelist and in `wireModeButtons()` (app.js), which is never called. Safe to delete. |
 
 State JSON fields: `have_state`, `crc_ok`, `seq`, `mode_machine`,
 `arm_engaged`, `arm_speed`, `traj_active`, `traj_name`, `traj_prog`,
+`teleop_live`, `q_cmd` (the 12 joint angles actually being commanded),
 `head_yaw_enabled`, and 26-wide `q`/`dq`/`tau`/`temp`/`vol`/`mstate`, plus
 `imu_rpy`/`imu_gyro`/`imu_acc`/`imu_quat`, `have_torso`, `torso_rpy`.
 
@@ -154,6 +170,47 @@ between power-ons, so commanding it could swing the head hard to one side. Slot 
 is never powered. The UI disables that slider and `headForward()` always draws
 the head facing forward. Scripted motions never command the head. The real fix
 is a motor-zero recalibration by Unitree.
+
+## Meta Quest teleop
+
+The robot has no Wi-Fi, so the Quest reaches it through the Mac: the Quest and
+the Mac share a Wi-Fi network, and `scripts/quest_tunnel.sh` relays the Mac's
+:8443 to the robot over SSH (`ssh -g -L`). WebXR only runs in a secure
+context, so the robot serves `quest.html` over HTTPS with a self-signed
+certificate (`certs/`, made with openssl on first start). The Quest Browser
+asks once to accept it.
+
+Run order: on the robot `./start.sh`. On the dashboard, ARM CONTROL → Engage.
+On the Mac `scripts/quest_tunnel.sh`. On the Quest, open the printed URL and
+tap Enter passthrough.
+
+Safety layers, outermost first:
+1. **Key.** The :8443 WebSocket needs `?key=` from `~/magikid_teleop/teleop_key`
+   (8 random characters, made on first start). Without it the upgrade gets a 403.
+   The relay puts this port on the Mac's Wi-Fi, so the key matters.
+2. **Whitelist.** :8443 may only send `teleop` and `teleop_stop`. Engaging,
+   motions and release are dashboard-only, so someone at the Mac has to engage first.
+3. **Page.** `TeleopCore` runs `checkPose` on every IK result and keeps the last
+   safe target instead. Refused poses are ones where a forearm comes within
+   10 cm of the other forearm, within 15 cm of the head centre, into the torso
+   box, or below the mounting surface. The limits are in `BODY` in `kin.js`; they
+   come from the STL bounding boxes and allow for the 3.6 cm forearm radius.
+4. **Bridge.** URDF clamping, a velocity cap of at most 1.0 rad/s, a 0.3 s
+   watchdog, and head yaw is never commanded.
+
+Mapping (`teleop.js`): holding a grip makes that hand move the robot hand tip
+relative to where the grip started, times the hand scale (0.7 by default).
+Controller rotation turns the forearm direction (low weight in the IK), and the
+twist about the pointing axis drives wrist roll. "Forward" is the operator's
+horizontal facing when they enter or click a thumbstick, and the operator is
+assumed to face the same way as the robot. Buttons (xr-standard indices):
+squeeze `[1]` = clutch, B/Y `[5]` = freeze, thumbstick press `[3]` = recentre.
+Head pitch follows the headset only when that option is ticked.
+
+The robot's reach is small: home already has the hand near full forward
+reach, so expect the hand to stop at the workspace edge. Verified so far: unit
+tests, the mock-XR test and the server integration test. **Not yet run on the
+headset or the robot.**
 
 ## Safety rules
 

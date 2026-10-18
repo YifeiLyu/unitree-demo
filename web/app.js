@@ -38,16 +38,7 @@ const JOINTS = [
   { name: "Head Yaw",        grp: "Head",       min: -2.0071,  max: 2.0071 },
 ];
 
-/* State-array indices the low-level arm control drives (12: arms + head, no
-   waist), matching the bridge's ARM_IDL / r1A_wrist_swing_example. */
-const ARM_CMD_IDX = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
-
-// short index lookups
-const IDX = {
-  L_SP: 14, L_SR: 15, L_SY: 16, L_EL: 17, L_WR: 18,
-  R_SP: 19, R_SR: 20, R_SY: 21, R_EL: 22, R_WR: 23,
-  WAIST_YAW: 13, HEAD_PITCH: 24, HEAD_YAW: 25,
-};
+/* IDX, ARM_CMD_IDX, KIN and computeFK live in kin.js (shared with the Quest page). */
 
 let latest = null;      // most recent state object
 let armEngaged = false; // reported by bridge
@@ -182,65 +173,6 @@ function buildCameras() {
   }).catch(() => {});
 }
 
-/* ---------------------------------------------------------------------- */
-/* 3D forward-kinematics skeleton (from the r1_a5 URDF)                    */
-/* ---------------------------------------------------------------------- */
-// Kinematic chain: parent, origin translation (xyz, metres), fixed rotation
-// (rpy), joint axis, and the state-array index that drives it. Values are the
-// exact URDF origins/axes for the R1-A upper body (r1_a5_description).
-const KIN = [
-  { n: "waist", par: null,    xyz: [0, 0, 0],                        rpy: [0, 0, 0],        axis: [0, 0, 1], q: IDX.WAIST_YAW },
-  { n: "l_sp",  par: "waist", xyz: [0, 0.085688, 0.19749],           rpy: [0.26187, 0, 0],  axis: [0, 1, 0], q: IDX.L_SP },
-  { n: "l_sr",  par: "l_sp",  xyz: [0.03445, 0.047132, -0.025693],   rpy: [-0.26187, 0, 0], axis: [1, 0, 0], q: IDX.L_SR },
-  { n: "l_sy",  par: "l_sr",  xyz: [-0.03445, 0.0043, -0.10835],     rpy: [0, 0, 0],        axis: [0, 0, 1], q: IDX.L_SY },
-  { n: "l_el",  par: "l_sy",  xyz: [0.016191, 0.026461, -0.082858],  rpy: [0, 0, 0],        axis: [0, 1, 0], q: IDX.L_EL },
-  { n: "l_wr",  par: "l_el",  xyz: [0.11218, -0.03002, -0.011702],   rpy: [0, 0, 0],        axis: [1, 0, 0], q: IDX.L_WR },
-  { n: "r_sp",  par: "waist", xyz: [0, -0.085688, 0.19749],          rpy: [-0.26187, 0, 0], axis: [0, 1, 0], q: IDX.R_SP },
-  { n: "r_sr",  par: "r_sp",  xyz: [0.03445, -0.047132, -0.025693],  rpy: [0.26187, 0, 0],  axis: [1, 0, 0], q: IDX.R_SR },
-  { n: "r_sy",  par: "r_sr",  xyz: [-0.03445, -0.0043, -0.10835],    rpy: [0, 0, 0],        axis: [0, 0, 1], q: IDX.R_SY },
-  { n: "r_el",  par: "r_sy",  xyz: [0.016191, -0.026461, -0.082858], rpy: [0, 0, 0],        axis: [0, 1, 0], q: IDX.R_EL },
-  { n: "r_wr",  par: "r_el",  xyz: [0.11218, 0.03002, -0.011702],    rpy: [0, 0, 0],        axis: [1, 0, 0], q: IDX.R_WR },
-  { n: "h_p",   par: "waist", xyz: [-0.006, 0.03155, 0.255],         rpy: [0, 0, 0],        axis: [0, 1, 0], q: IDX.HEAD_PITCH },
-  { n: "h_y",   par: "h_p",   xyz: [0.0010126, -0.03155, 0.1165],    rpy: [0, 0, 0],        axis: [0, 0, 1], q: IDX.HEAD_YAW },
-];
-
-// --- tiny 3x3 matrix / vec3 helpers ---
-function mMul(a, b) { const c = [[0,0,0],[0,0,0],[0,0,0]];
-  for (let i=0;i<3;i++) for (let j=0;j<3;j++){ let s=0; for (let k=0;k<3;k++) s+=a[i][k]*b[k][j]; c[i][j]=s; } return c; }
-function mVec(a, v) { return [a[0][0]*v[0]+a[0][1]*v[1]+a[0][2]*v[2],
-                              a[1][0]*v[0]+a[1][1]*v[1]+a[1][2]*v[2],
-                              a[2][0]*v[0]+a[2][1]*v[1]+a[2][2]*v[2]]; }
-function rpyR(r, p, y) { // URDF fixed-axis rpy: Rz(y)·Ry(p)·Rx(r)
-  const cr=Math.cos(r),sr=Math.sin(r),cp=Math.cos(p),sp=Math.sin(p),cy=Math.cos(y),sy=Math.sin(y);
-  const Rx=[[1,0,0],[0,cr,-sr],[0,sr,cr]];
-  const Ry=[[cp,0,sp],[0,1,0],[-sp,0,cp]];
-  const Rz=[[cy,-sy,0],[sy,cy,0],[0,0,1]];
-  return mMul(Rz, mMul(Ry, Rx));
-}
-function axisR(ax, q) { // Rodrigues rotation about unit axis by q
-  const [x,y,z]=ax, c=Math.cos(q), s=Math.sin(q), t=1-c;
-  return [[t*x*x+c,   t*x*y-s*z, t*x*z+s*y],
-          [t*x*y+s*z, t*y*y+c,   t*y*z-s*x],
-          [t*x*z-s*y, t*y*z+s*x, t*z*z+c]];
-}
-
-// Forward kinematics -> world position of every joint frame + a few tips.
-function computeFK(q) {
-  const I = [[1,0,0],[0,1,0],[0,0,1]];
-  const F = { root: { R: I, p: [0,0,0] } };
-  for (const j of KIN) {
-    const parent = F[j.par || "root"];
-    const localR = mMul(rpyR(j.rpy[0], j.rpy[1], j.rpy[2]), axisR(j.axis, q[j.q]));
-    const R = mMul(parent.R, localR);
-    const dp = mVec(parent.R, j.xyz);
-    F[j.n] = { R, p: [parent.p[0]+dp[0], parent.p[1]+dp[1], parent.p[2]+dp[2]] };
-  }
-  F.l_tip = { p: addLocal(F.l_wr, [0.10, 0, 0]) };  // hand
-  F.r_tip = { p: addLocal(F.r_wr, [0.10, 0, 0]) };
-  F.h_top = { p: addLocal(F.h_y,  [0.03, 0, 0.09]) }; // gaze / crown
-  return F;
-}
-function addLocal(f, off) { const d = mVec(f.R, off); return [f.p[0]+d[0], f.p[1]+d[1], f.p[2]+d[2]]; }
 
 // --- camera / projection ---
 let viewAz = 1.05, viewEl = 0.32;   // default 3/4 view
@@ -476,6 +408,8 @@ function updateHeader(s) {
   ap.classList.toggle("on", armEngaged);
   ap.classList.remove("warn");
   $("#arm-state").textContent = armEngaged ? "controlling" : "released";
+  $("#pill-quest").classList.toggle("on", !!s.teleop_live);
+  $("#quest-state").textContent = s.teleop_live ? "driving arms" : "idle";
   onMotionState(s);
   updateMotionButtons();
   updateHeadWarn(s);

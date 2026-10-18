@@ -9,6 +9,11 @@ Ties together three things and serves them on one HTTP port:
      and browser commands are forwarded to its stdin.
   2. Two onboard cameras, streamed as MJPEG via OpenCV (cv2 + V4L2).
   3. The static single-page dashboard in ``web/``.
+  4. Optionally a second, HTTPS listener (default :8443) for the Meta Quest
+     teleop page ``web/quest.html``. WebXR needs a secure context, so it uses a
+     self-signed certificate generated on first start. That listener requires a
+     key (``?key=`` from the ``teleop_key`` file) and may only send streamed
+     teleop targets: engaging, motions and release stay on the dashboard.
 
 Runs on the robot's Orin (Ubuntu 20.04, Python 3.8, tornado, cv2). No internet
 or extra pip packages required.
@@ -18,8 +23,11 @@ when the browser explicitly sends them, and the bridge stays inert (weight 0)
 until an explicit engage. See magikid_bridge.cpp.
 """
 
+import hmac
 import json
 import os
+import secrets
+import ssl
 import subprocess
 import threading
 import time
@@ -40,6 +48,11 @@ except Exception as e:  # pragma: no cover
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
+
+# Commands each listener may forward to the bridge.
+DASHBOARD_CMDS = ("arm_engage", "arm_release", "estop", "arm_weight", "arm_speed",
+                  "arm_set", "loco", "traj", "traj_stop", "teleop_stop")
+QUEST_CMDS = ("teleop", "teleop_stop")
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +268,13 @@ class StateWSHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
         return True  # LAN-only tool on a direct link
 
+    def prepare(self):
+        # The Quest listener is reachable from Wi-Fi through the Mac's tunnel,
+        # so it needs the teleop key before the WebSocket upgrade.
+        key = self.settings.get("teleop_key")
+        if key and not hmac.compare_digest(self.get_argument("key", ""), key):
+            raise tornado.web.HTTPError(403)
+
     def open(self):
         BRIDGE.clients.add(self)
         if BRIDGE.latest_state is not None:
@@ -269,9 +289,7 @@ class StateWSHandler(tornado.websocket.WebSocketHandler):
         except ValueError:
             return
         # Only forward known command types to the bridge.
-        if obj.get("type") in ("arm_engage", "arm_release", "estop",
-                                "arm_weight", "arm_speed", "arm_set", "loco",
-                                "traj", "traj_stop"):
+        if obj.get("type") in self.settings.get("commands", DASHBOARD_CMDS):
             BRIDGE.send_command(obj)
 
     def on_close(self):
@@ -322,8 +340,11 @@ class MetaHandler(tornado.web.RequestHandler):
 
 
 class IndexHandler(tornado.web.RequestHandler):
+    def initialize(self, page="index.html"):
+        self.page = page
+
     def get(self):
-        self.render_from_file("index.html")
+        self.render_from_file(self.page)
 
     def render_from_file(self, name):
         with open(os.path.join(WEB_DIR, name), "rb") as f:
@@ -331,14 +352,41 @@ class IndexHandler(tornado.web.RequestHandler):
             self.write(f.read())
 
 
-def make_app():
-    return tornado.web.Application([
-        (r"/", IndexHandler),
-        (r"/ws", StateWSHandler),
-        (r"/cam/(\d+)", MjpegHandler),
-        (r"/api/meta", MetaHandler),
-        (r"/(.*)", tornado.web.StaticFileHandler, {"path": WEB_DIR}),
-    ])
+def make_app(page="index.html", cameras=True, **settings):
+    routes = [(r"/", IndexHandler, {"page": page}), (r"/ws", StateWSHandler)]
+    if cameras:  # the Quest listener is on Wi-Fi with no key on these: leave them off
+        routes += [(r"/cam/(\d+)", MjpegHandler), (r"/api/meta", MetaHandler)]
+    routes.append((r"/(.*)", tornado.web.StaticFileHandler, {"path": WEB_DIR}))
+    return tornado.web.Application(routes, **settings)
+
+
+def ensure_cert(cert_dir):
+    """Self-signed TLS cert for the Quest listener (WebXR needs HTTPS)."""
+    cert = os.path.join(cert_dir, "cert.pem")
+    key = os.path.join(cert_dir, "key.pem")
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        os.makedirs(cert_dir, exist_ok=True)
+        print("[https] generating self-signed certificate in", cert_dir)
+        subprocess.check_call(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-days", "3650", "-subj", "/CN=magikid-r1a",
+             "-keyout", key, "-out", cert],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return cert, key
+
+
+def load_teleop_key(path):
+    """Read the Quest teleop key, creating a random one on first start."""
+    if os.path.exists(path):
+        with open(path) as f:
+            key = f.read().strip()
+        if key:
+            return key
+    key = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(8))
+    with open(path, "w") as f:
+        f.write(key + "\n")
+    os.chmod(path, 0o600)
+    return key
 
 
 def main():
@@ -351,6 +399,11 @@ def main():
     ap.add_argument("--cameras", default="auto",
                     help="'auto' to detect, or a comma list of index:/dev/videoN[:label]")
     ap.add_argument("--no-cameras", action="store_true")
+    ap.add_argument("--https-port", type=int, default=8443,
+                    help="Quest teleop HTTPS port (0 disables)")
+    ap.add_argument("--https-address", default="0.0.0.0")
+    ap.add_argument("--cert-dir", default=os.path.join(HERE, "certs"))
+    ap.add_argument("--teleop-key-file", default=os.path.join(HERE, "teleop_key"))
     args = ap.parse_args()
 
     ioloop = tornado.ioloop.IOLoop.current()
@@ -381,8 +434,24 @@ def main():
 
     app = make_app()
     app.listen(args.port, address="0.0.0.0")
+    quest_url = None
+    if args.https_port:
+        try:
+            cert, key = ensure_cert(args.cert_dir)
+            ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ctx.load_cert_chain(cert, key)
+            teleop_key = load_teleop_key(args.teleop_key_file)
+            quest = make_app(page="quest.html", cameras=False,
+                             teleop_key=teleop_key, commands=QUEST_CMDS)
+            quest.listen(args.https_port, address=args.https_address, ssl_options=ctx)
+            quest_url = "https://<host>:%d/?key=%s" % (args.https_port, teleop_key)
+        except Exception as e:
+            print("[https] Quest listener disabled:", e)
     print("=" * 60)
     print(" Magikid R1-A dashboard:  http://<robot-ip>:%d/" % args.port)
+    if quest_url:
+        print(" Quest teleop page:       %s" % quest_url)
+        print("   (from the Mac: scripts/quest_tunnel.sh prints the exact URL)")
     print(" DDS interface: %s   state rate: %d Hz" % (args.iface, args.rate))
     print("=" * 60)
     try:

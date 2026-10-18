@@ -4,7 +4,7 @@ A browser dashboard for the Magikid lab's **Unitree R1-A** (upper-body
 humanoid, URDF `r1_a5`). It shows the live arm pose on a 3D model, telemetry
 for every joint, the body IMU and the onboard cameras. It also has a
 **safety-gated** panel for commanding both arms over low-level `rt/lowcmd`,
-and scripted motions (go home, wave).
+scripted motions (go home, wave), and **Meta Quest 3S teleop** over WebXR.
 
 It runs entirely **on the robot's Orin** (Ubuntu 20.04). It needs no internet
 and no extra `pip`/`apt` packages: it uses the pre-installed `unitree_sdk2`,
@@ -26,7 +26,8 @@ Connect the robot over ethernet and give your machine a static IP on
 
 ```bash
 # copy to the robot (the bridge is built there)
-rsync -av --exclude .git --exclude bridge/build ./ unitree@192.168.123.164:~/magikid_teleop/
+rsync -av --exclude .git --exclude bridge/build --exclude certs --exclude teleop_key \
+  ./ unitree@192.168.123.164:~/magikid_teleop/
 
 # on the robot
 ssh unitree@192.168.123.164
@@ -56,6 +57,30 @@ Then open **http://192.168.123.164:8080/**.
   **Motions** (Go home / Wave left / Wave right). Each motion is previewed on
   the 3D model with a clearance check before it runs.
 
+## Meta Quest 3S teleop
+
+Drive both arms by hand from a Quest, in passthrough so you can see the robot.
+
+1. Put the Quest on the **same Wi-Fi as the Mac** that is wired to the robot.
+2. Start the dashboard on the robot (`./start.sh`). On the dashboard, switch
+   ARM CONTROL on and press **Engage**. The headset can't engage the arms by itself.
+3. On the Mac, run `scripts/quest_tunnel.sh`. It prints a URL like
+   `https://192.168.1.218:8443/?key=…`.
+4. In the Quest Browser, open that URL. On the first visit, accept the
+   self-signed certificate (Advanced → Proceed). Pick the hand scale and speed,
+   then tap **Enter passthrough**.
+
+| Control | Action |
+|---|---|
+| Hold **grip** | That robot arm follows your hand, relative to where you grabbed. Twist to roll the wrist. Let go and the arm holds. |
+| **B / Y** | FREEZE both arms. Release both grips and grab again to resume. |
+| Thumbstick **click** | Re-centre "forward" to where you're looking. |
+
+Stand behind the robot, facing the same way it faces. The page refuses
+poses that would hit the robot's body, its head, the other arm or the base,
+and the controller buzzes when that happens. If the headset or Wi-Fi drops,
+the bridge holds the arms after 0.3 s. The dashboard E-STOP still works.
+
 ## Safety model
 
 1. The bridge is **read-only** until it receives an explicit `arm_engage`.
@@ -69,6 +94,9 @@ Then open **http://192.168.123.164:8080/**.
    motion service. Be ready to support the arms when you release.
 6. **Head yaw is disabled.** Its sensor offset varies between power-ons, so it
    is never powered or commanded.
+7. **Quest teleop** uses its own HTTPS port. That port needs a key and can
+   only stream arm targets or freeze. Engaging, motions and release stay on
+   the dashboard.
 
 Verified on hardware: arm control on 2026-10-02, motions on 2026-10-04. Always
 keep the workspace clear and have someone at the E-STOP.
@@ -77,14 +105,18 @@ keep the workspace clear and have someone at the E-STOP.
 
 ```
 ├── run.sh / start.sh       launcher (builds bridge if needed) / background starter
-├── server.py               tornado: static + WebSocket + MJPEG + bridge process
+├── server.py               tornado: static + WebSocket + MJPEG + bridge process (+ HTTPS for the Quest)
+├── scripts/quest_tunnel.sh Mac-side Wi-Fi relay for the Quest
+├── tests/                  Node + Python tests that run without the robot
 ├── r1_a5.urdf              joint origins, axes, limits (source of truth)
 ├── bridge/
 │   ├── magikid_bridge.cpp  DDS <-> JSON bridge and arm control (unitree_sdk2)
 │   └── CMakeLists.txt
 └── web/
     ├── index.html, style.css
-    ├── app.js              dashboard logic, FK, motions
+    ├── kin.js              shared URDF kinematics, arm IK, self-collision check
+    ├── app.js              dashboard logic, motions
+    ├── quest.html, quest.js, teleop.js   Meta Quest WebXR teleop page
     ├── model3d.js          three.js URDF mesh viewer
     ├── vendor/             three.js r128 + STLLoader + OrbitControls
     └── model/meshes/       r1_a5 STL meshes

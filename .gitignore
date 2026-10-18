@@ -2,3 +2,6 @@ bridge/build/
 __pycache__/
 *.pyc
 .DS_Store
+# generated on the robot at first start
+certs/
+teleop_key

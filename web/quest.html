@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Magikid · R1-A Quest Teleop</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .q-wrap { max-width: 760px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+    .q-status { display: flex; flex-wrap: wrap; gap: 8px; }
+    .q-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .q-row label { color: var(--mut); font-size: 13px; display: flex; gap: 8px; align-items: center; }
+    .q-row select { background: var(--card2); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 14px; }
+    .q-enter { font-size: 18px; padding: 14px 22px; }
+    .q-help { margin: 0; padding-left: 18px; color: var(--mut); line-height: 1.7; }
+    .q-help b { color: var(--txt); }
+    .q-note { color: var(--warn); font-size: 13px; }
+    .q-err { color: var(--danger); font-size: 13px; }
+    .q-err.hidden, .q-note.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div class="brand-txt">
+        <div class="brand-lab">MAGIKID<span class="dot">·</span>LAB</div>
+        <div class="brand-sub">Unitree R1-A — Meta Quest teleop</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="q-wrap">
+    <section class="card">
+      <div class="card-head"><h2>Status</h2><span class="hint">from the robot</span></div>
+      <div class="q-status">
+        <div class="pill" id="pill-link"><span class="led"></span><span class="pill-label">link</span><b id="link-state">connecting…</b></div>
+        <div class="pill" id="pill-arm"><span class="led"></span><span class="pill-label">arms</span><b id="arm-state">–</b></div>
+        <div class="pill" id="pill-tele"><span class="led"></span><span class="pill-label">teleop</span><b id="tele-state">idle</b></div>
+      </div>
+      <p class="q-err hidden" id="key-err">Could not connect. Open this page with the URL printed by
+        <code>scripts/quest_tunnel.sh</code> (it ends in <code>?key=…</code>).</p>
+      <p class="q-note" id="engage-note">Engage the arms on the dashboard first (ARM CONTROL → Engage). The headset can't engage them.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Settings</h2><span class="hint">change before entering</span></div>
+      <div class="q-row">
+        <label>Hand scale
+          <select id="opt-scale">
+            <option value="0.5">0.5×</option>
+            <option value="0.7" selected>0.7×</option>
+            <option value="1.0">1.0×</option>
+          </select></label>
+        <label>Max speed
+          <select id="opt-speed">
+            <option value="0.4">Slow (0.4 rad/s)</option>
+            <option value="0.7" selected>Normal (0.7 rad/s)</option>
+            <option value="1.0">Fast (1.0 rad/s)</option>
+          </select></label>
+        <label><input type="checkbox" id="opt-head" /> Robot head follows my head (pitch)</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="q-row">
+        <button class="btn btn-go q-enter" id="btn-ar" disabled>Enter passthrough</button>
+        <button class="btn q-enter" id="btn-vr" disabled>Enter VR</button>
+      </div>
+      <p class="q-err hidden" id="xr-err"></p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Controls</h2></div>
+      <ul class="q-help">
+        <li>Stand <b>behind the robot, facing the same way</b>. Your forward is captured on entering.</li>
+        <li><b>Hold a grip</b> to move that arm. The robot hand follows your hand <b>relative</b> to where you grabbed. Twist the controller to roll the wrist.</li>
+        <li><b>Let go</b> and the arm stays put. Grab again somewhere comfortable to keep going.</li>
+        <li><b>B or Y</b> = FREEZE: both arms hold immediately. Release both grips, then grab again to resume.</li>
+        <li><b>Click a thumbstick</b> = re-centre forward to where you are looking.</li>
+        <li>Poses that would hit the body, the head, the other hand or the base are refused (the controller buzzes). The dashboard E-STOP still works.</li>
+      </ul>
+    </section>
+  </main>
+  <div class="log-bar"><span class="log-tag">bridge</span><span id="log-line">waiting for telemetry…</span></div>
+
+  <script src="vendor/three.min.js"></script>
+  <script src="kin.js"></script>
+  <script src="teleop.js"></script>
+  <script src="quest.js"></script>
+</body>
+</html>

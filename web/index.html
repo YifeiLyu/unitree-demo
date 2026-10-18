@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Magikid · R1-A Console</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div class="brand-txt">
+        <div class="brand-lab">MAGIKID<span class="dot">·</span>LAB</div>
+        <div class="brand-sub">Unitree R1-A — Teleoperation &amp; Telemetry</div>
+      </div>
+    </div>
+    <div class="status-cluster">
+      <div class="pill" id="pill-link"><span class="led"></span><span class="pill-label">link</span><b id="link-state">connecting…</b></div>
+      <div class="pill" id="pill-rate"><span class="pill-label">state</span><b id="rate-hz">– Hz</b></div>
+      <div class="pill" id="pill-crc"><span class="pill-label">crc</span><b id="crc-state">–</b></div>
+      <div class="pill" id="pill-mode"><span class="pill-label">type</span><b id="mode-machine">–</b></div>
+      <div class="pill" id="pill-arm"><span class="led"></span><span class="pill-label">arms</span><b id="arm-state">released</b></div>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- ---------------------------------------------------------------- -->
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card span-viz">
+      <div class="card-head"><h2>Arm Pose</h2><span class="hint">URDF forward kinematics · drag to orbit</span></div>
+      <div class="viz-cell viz-3d">
+        <div id="view3d"></div>
+        <svg id="svg3d" viewBox="0 0 340 380" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="sim-banner hidden" id="sim-banner">SIMULATION PREVIEW · robot is not moving</div>
+        <div class="viz-badges">
+          <button class="vbtn" data-view="front">front</button>
+          <button class="vbtn" data-view="side">side</button>
+          <button class="vbtn" data-view="iso">3/4</button>
+          <button class="vbtn" data-view="top">top</button>
+        </div>
+      </div>
+      <div class="dial-row">
+        <div class="dial"><svg id="dial-waist" viewBox="0 0 90 90"></svg><span>Waist Yaw</span></div>
+        <div class="dial"><svg id="dial-headyaw" viewBox="0 0 90 90"></svg><span>Head Yaw (raw)</span></div>
+        <div class="dial"><svg id="dial-headpitch" viewBox="0 0 90 90"></svg><span>Head Pitch</span></div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card span-cams">
+      <div class="card-head"><h2>Cameras</h2><span class="hint" id="cam-hint">onboard UVC</span></div>
+      <div class="cam-grid" id="cam-grid"></div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card span-imu">
+      <div class="card-head"><h2>Body IMU</h2><span class="hint">pelvis</span></div>
+      <div class="imu-wrap">
+        <div class="horizon-box"><svg id="svg-horizon" viewBox="0 0 160 160"></svg></div>
+        <div class="imu-nums">
+          <div class="imu-row"><span>roll</span><b id="imu-roll">0.0°</b></div>
+          <div class="imu-row"><span>pitch</span><b id="imu-pitch">0.0°</b></div>
+          <div class="imu-row"><span>yaw</span><b id="imu-yaw">0.0°</b></div>
+          <div class="imu-sep"></div>
+          <div class="imu-row small"><span>gyro</span><b id="imu-gyro">0, 0, 0</b></div>
+          <div class="imu-row small"><span>accel</span><b id="imu-acc">0, 0, 0</b></div>
+          <div class="imu-row small"><span>torso rpy</span><b id="imu-torso">–</b></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card span-joints">
+      <div class="card-head">
+        <h2>Joints</h2>
+        <div class="tabs">
+          <button class="tab active" data-tab="arms">Arms &amp; Head</button>
+          <button class="tab" data-tab="all">All 26</button>
+        </div>
+      </div>
+      <div id="joint-arms" class="joint-view"></div>
+      <div id="joint-all" class="joint-view hidden"></div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card span-cmd">
+      <div class="card-head"><h2>Arm Command</h2><span class="hint">rt/lowcmd</span></div>
+
+      <div class="safety" id="safety">
+        <div class="safety-warn">
+          <b>Motion is locked.</b> Enabling arm control takes <b>direct low-level
+          control</b> of the arms + head over <code>rt/lowcmd</code> (12 joints;
+          the robot's holding controller is released). Moves are speed-limited and
+          clamped to joint limits, but keep the area clear.
+        </div>
+        <label class="master">
+          <input type="checkbox" id="master-toggle" />
+          <span class="switch"></span>
+          <span class="master-label">ARM CONTROL</span>
+        </label>
+      </div>
+
+      <div class="motions">
+        <div class="motions-row">
+          <span>Motions:</span>
+          <button class="btn btn-sm motion" data-motion="home">Go home</button>
+          <button class="btn btn-sm motion" data-motion="wave_l">Wave left</button>
+          <button class="btn btn-sm motion" data-motion="wave_r">Wave right</button>
+          <select id="motion-speed" class="btn btn-sm" title="Gesture speed">
+            <option value="0.6">Slow</option>
+            <option value="1" selected>Normal</option>
+          </select>
+        </div>
+        <div class="motion-preview hidden" id="motion-preview">
+          <div class="mp-info"><b id="mp-name">–</b> <span id="mp-dur"></span>
+            <div id="mp-check" class="mp-check"></div>
+            <div class="mp-prog"><div id="mp-prog-fill"></div></div></div>
+          <div class="mp-actions">
+            <button id="mp-run" class="btn btn-go" disabled>Run on robot</button>
+            <button id="mp-stop" class="btn btn-stop hidden">Stop motion</button>
+            <button id="mp-close" class="btn">Close preview</button>
+          </div>
+        </div>
+        <div class="motions-row home-row">
+          <span>Home pose:</span>
+          <button class="btn btn-sm" id="btn-home-save" disabled>Save sliders as home</button>
+          <button class="btn btn-sm" id="btn-home-reset">Reset home</button>
+        </div>
+      </div>
+
+      <div class="head-warn hidden" id="head-warn"></div>
+
+      <div class="cmd-body locked" id="cmd-body">
+        <div class="cmd-actions">
+          <button id="btn-engage" class="btn btn-primary" disabled>Engage</button>
+          <button id="btn-sync" class="btn" disabled>Sync&nbsp;to&nbsp;current</button>
+          <button id="btn-send" class="btn btn-go" disabled>Send&nbsp;targets</button>
+          <button id="btn-estop" class="btn btn-stop" disabled>E-STOP</button>
+        </div>
+
+        <div class="weight-row">
+          <label>Move speed (rad/s)</label>
+          <input type="range" id="weight" min="0.05" max="1.0" step="0.05" value="0.20" disabled />
+          <b id="weight-val">0.20</b>
+        </div>
+
+        <div class="presets">
+          <span>Presets:</span>
+          <button class="btn btn-sm preset" data-preset="sync" disabled>Hold current</button>
+          <button class="btn btn-sm preset" data-preset="zero" disabled>Zero pose</button>
+          <button class="btn btn-sm preset" data-preset="tpose" disabled>Arms out</button>
+        </div>
+
+        <div id="cmd-sliders" class="cmd-sliders"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="log-bar"><span class="log-tag">bridge</span><span id="log-line">waiting for telemetry…</span></div>
+
+  <!-- WebGL URDF mesh viewer (optional; falls back to the SVG skeleton) -->
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/STLLoader.js"></script>
+  <script src="vendor/OrbitControls.js"></script>
+  <script src="model3d.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

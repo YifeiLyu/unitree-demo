@@ -22,7 +22,7 @@ function el(id) {
     addEventListener(ev, fn) { this.handlers[ev] = fn; },
   });
 }
-el("opt-scale").value = "0.7"; el("opt-speed").value = "0.7";
+el("opt-scale").value = "0.7"; el("opt-speed").value = "0.7"; el("opt-arms").value = "both";
 const ctx2d = new Proxy({}, { get: () => () => {} });
 const docHandlers = {};
 const document = {
@@ -37,47 +37,41 @@ class FakeWS {
   send(m) { sent.push(JSON.parse(m)); }
   close() {}
 }
-// --- three.js stubs (only what quest.js touches) ---
-class V3 { constructor(x = 0, y = 0, z = 0) { this.x = x; this.y = y; this.z = z; } copy(v) { Object.assign(this, v); return this; } set(x, y, z) { this.x = x; this.y = y; this.z = z; } }
-class Obj { constructor() { this.position = new V3(); this.quaternion = { set() {} }; this.matrix = { copy() {} }; this.children = []; this.visible = true; } add(...c) { this.children.push(...c); } lookAt() {} }
+// --- three.js: the real r128 build, only the WebGL renderer is stubbed ---
 let animLoop = null, session = null;
-const THREE = {
-  WebGLRenderer: class { constructor() { this.xr = { enabled: false, setReferenceSpaceType() {}, getReferenceSpace: () => "ref", setSession: async (s) => { session = s; } }; }
-    setPixelRatio() {} setClearColor() {} setAnimationLoop(f) { animLoop = f; } render() {} },
-  Scene: Obj, Group: Obj, PerspectiveCamera: Obj, HemisphereLight: Obj,
-  Mesh: class extends Obj { constructor(g, m) { super(); this.geometry = g; this.material = m; } },
-  LineSegments: class extends Obj { constructor(g) { super(); this.geometry = g; } },
-  PlaneGeometry: class {}, ConeGeometry: class { rotateX() {} }, CanvasTexture: class {},
-  MeshBasicMaterial: class { constructor() { this.color = { set() {} }; } }, LineBasicMaterial: class {},
-  BufferGeometry: class { setAttribute(n, a) { this.attributes = { [n]: a }; } },
-  BufferAttribute: class { constructor(a) { this.array = a; } },
-  Vector3: V3,
-  Matrix4: class { makeBasis() { return this; } setPosition() { return this; } },
-};
+class FakeRenderer {
+  constructor() { this.xr = { enabled: false, setReferenceSpaceType() {}, getReferenceSpace: () => "ref", setSession: async (s) => { session = s; } }; }
+  setPixelRatio() {} setClearColor() {} setAnimationLoop(f) { animLoop = f; }
+  render(scene) { scene.updateMatrixWorld(); }     // what a real render does to matrices
+}
 const navigator = { xr: {
   isSessionSupported: async () => true,
   requestSession: async (mode) => ({ mode, inputSources: [], ev: {}, addEventListener(e, f) { this.ev[e] = f; } }),
 } };
 
-const sandbox = { console, document, navigator, THREE, WebSocket: FakeWS, setTimeout, setImmediate,
+const sandbox = { console, document, navigator, WebSocket: FakeWS, setTimeout, setImmediate,
   location: { protocol: "https:", host: "mac:8443", search: "?key=abc123" },
-  URLSearchParams, Promise, Math, JSON, Set, Number, Object, Array, Float32Array,
+  URLSearchParams, Promise, Math, JSON, Set, Number, Object, Array, Float32Array, performance,
   window: { devicePixelRatio: 1, isSecureContext: true, addEventListener: (e, f) => (docHandlers[e] = f) } };
 vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(path.join(WEB, "vendor", "three.min.js"), "utf8"), sandbox, { filename: "three.min.js" });
+const THREE = sandbox.THREE;
+THREE.WebGLRenderer = FakeRenderer;
 for (const f of ["kin.js", "teleop.js", "quest.js"])
   vm.runInContext(fs.readFileSync(path.join(WEB, f), "utf8"), sandbox, { filename: f });
 
 // --- XR frame helpers ---
-function pad(pressed) { return { buttons: [0, 1, 2, 3, 4, 5].map((i) => ({ pressed: pressed.includes(i) })), hapticActuators: [{ pulse: async () => {} }] }; }
-function src(hand, pos, pressed) {
-  return { handedness: hand, targetRaySpace: { pos }, gamepad: pad(pressed || []) };
+function pad(pressed) { return { buttons: [0, 1, 2, 3, 4, 5].map((i) => ({ pressed: pressed.includes(i) })), axes: [0, 0, 0, 0], hapticActuators: [{ pulse: async () => {} }] }; }
+function src(hand, pos, pressed, quat) {
+  return { handedness: hand, targetRaySpace: { pos, quat: quat || [0, 0, 0, 1] }, gamepad: pad(pressed || []) };
 }
 function frame(sources) {
   session.inputSources = sources;
   return {
     session,
     getViewerPose: () => ({ transform: { position: { x: 0, y: 1.6, z: 0 }, orientation: { x: 0, y: 0, z: 0, w: 1 } } }),
-    getPose: (space) => ({ transform: { position: { x: space.pos[0], y: space.pos[1], z: space.pos[2] }, orientation: { x: 0, y: 0, z: 0, w: 1 } } }),
+    getPose: (space) => ({ transform: { position: { x: space.pos[0], y: space.pos[1], z: space.pos[2] },
+                                        orientation: { x: space.quat[0], y: space.quat[1], z: space.quat[2], w: space.quat[3] } } }),
   };
 }
 function state(engaged, q12, teleop) {
@@ -100,11 +94,16 @@ const teleops = () => sent.filter((m) => m.type === "teleop");
   assert.ok(session && session.mode === "immersive-ar" && animLoop, "AR session started");
 
   state(false, READY);
-  step([src("left", [0, 1, 0], [1])], 10);
+  for (let i = 0; i <= 10; i++) step([src("left", [0, 1, -0.005 * i], [1])]);
   assert.strictEqual(teleops().length, 0, "nothing sent while not engaged");
-  console.log("ok  not engaged -> no teleop frames");
+  const prev = vm.runInContext("core.out.slice(0, 5)", sandbox);
+  assert.ok(Math.abs(prev[0] - READY[0]) > 0.02 || Math.abs(prev[3] - READY[3]) > 0.02, "preview: grip moves the green ghost target");
+  step([src("left", [0, 1, 0])], 2);                    // let go
+  console.log("ok  not engaged -> PREVIEW: grip moves the ghost, no teleop frames sent");
 
   state(true, READY);
+  const afterEngage = vm.runInContext("core.out ? core.out.slice(0, 5) : null", sandbox);
+  assert.ok(afterEngage === null, "engaging discards the preview (no jump to the preview pose)");
   step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])], 6);
   const hb = teleops();
   assert.ok(hb.length >= 2 && hb.every((m) => m.mask.join() === "0,0,0"), "heartbeats with empty mask");
@@ -130,6 +129,96 @@ const teleops = () => sent.filter((m) => m.type === "teleop");
   step([src("left", [0, 1, -0.1], [1]), src("right", [0.3, 1, 0])], 6);   // grab again
   assert.ok(teleops().length > 0, "resumes after release + re-grab");
   console.log("ok  B/Y freezes (teleop_stop, sending stops); release + re-grab resumes");
+
+  // the stage: backdrop behind the figures (farther from you), YOU on your left of ROBOT,
+  // your hand ball follows the controller, the target ball shows while gripping
+  {
+    const ctx0 = (e) => vm.runInContext(e, sandbox);
+    const head = new THREE.Vector3(0, 1.6, 0);
+    const wp = (e) => ctx0(e + ".getWorldPosition(new THREE.Vector3())");
+    const back = wp("backdrop"), robotHead = wp("robotLive.meshes[3]"), youHead = wp("human.head");
+    assert.ok(back.distanceTo(head) > robotHead.distanceTo(head), "backdrop is behind the robot figure");
+    assert.ok(youHead.x < robotHead.x, "YOU is drawn to the left of ROBOT (XR -X = your left)");
+    step([src("left", [0, 1.2, -0.3]), src("right", [0.3, 1, 0])], 2);
+    const h1 = wp("human.hand.l");
+    step([src("left", [0, 1.4, -0.3]), src("right", [0.3, 1, 0])], 2);
+    const h2 = wp("human.hand.l");
+    const k = ctx0("HUMAN_SCALE * STAGE_SCALE");
+    assert.ok(Math.abs(h2.y - h1.y - 0.2 * k) < 1e-3, "your left hand ball rose with the controller: " + (h2.y - h1.y));
+    assert.ok(!ctx0("handTgt.l.visible"), "no target ball while not gripping");
+    step([src("left", [0, 1.4, -0.3], [1]), src("right", [0.3, 1, 0])], 3);
+    assert.ok(ctx0("handTgt.l.visible"), "target ball shows while gripping");
+    step([src("left", [0, 1.4, -0.3]), src("right", [0.3, 1, 0])], 2);
+    console.log("ok  stage: dark backdrop behind the figures, YOU left of ROBOT, hand + target balls follow");
+  }
+
+  // drag the status panel: point at it from the head, hold the trigger, move 20 cm right
+  const ctx = (expr) => vm.runInContext(expr, sandbox);
+  const hud0 = ctx("hudMesh.position.clone()");
+  const eye = new THREE.Vector3(0, 1.6, 0);
+  const aim = (from, to) => { const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), to.clone().sub(from).normalize()); return [q.x, q.y, q.z, q.w]; };
+  const qa = aim(eye, hud0);
+  const at = (dx, pressed) => [src("right", [eye.x + dx, eye.y, eye.z], pressed, qa), src("left", [0, 1, 0])];
+  step(at(0, []), 2);                                   // hover
+  assert.ok(ctx("rayLine.r.scale.z") < 1.0, "ray stops at the panel when pointing at it");
+  sent.length = 0;
+  step(at(0, [0, 1]));                                   // trigger (+ grip) on the panel: grab
+  assert.ok(ctx("drag.r && drag.r.what") === "hud", "trigger on the panel grabs it");
+  for (let i = 1; i <= 10; i++) step(at(0.02 * i, [0, 1]));
+  const hud1 = ctx("hudMesh.position.clone()");
+  assert.ok(Math.abs(hud1.x - hud0.x - 0.2) < 0.01 && Math.abs(hud1.y - hud0.y) < 0.01, "panel moved 20 cm right: " + (hud1.x - hud0.x));
+  assert.ok(teleops().every((m) => m.mask[1] === 0), "grip while dragging does not move the right arm");
+  step(at(0.2, []));                                      // release trigger
+  step(at(0.5, []), 3);
+  assert.ok(ctx("hudMesh.position").distanceTo(hud1) < 1e-6, "panel stays after release");
+  console.log("ok  trigger drags the status panel (moved 20 cm), arm ignores grip meanwhile, stays on release");
+
+  // drag the whole YOU|ROBOT stage by its backdrop
+  const g0 = ctx("new THREE.Vector3().setFromMatrixPosition(stage.matrix)");
+  const gc = ctx("backdrop.getWorldPosition(new THREE.Vector3())");
+  const qg = aim(eye, gc);
+  const gat = (dy, pressed) => [src("left", [eye.x, eye.y + dy, eye.z], pressed, qg), src("right", [0.3, 1, 0])];
+  step(gat(0, []), 2);
+  step(gat(0, [0]));
+  assert.ok(ctx("drag.l && drag.l.what") === "stage", "trigger on the backdrop grabs the stage");
+  for (let i = 1; i <= 10; i++) step(gat(0.015 * i, [0]));
+  const g1 = ctx("new THREE.Vector3().setFromMatrixPosition(stage.matrix)");
+  assert.ok(Math.abs(g1.y - g0.y - 0.15) < 0.01, "stage moved 15 cm up: " + (g1.y - g0.y));
+  step(gat(0.15, []));
+  console.log("ok  trigger on the backdrop drags the whole YOU|ROBOT stage");
+
+  // A/X cycles both -> left only -> right only; the unselected arm ignores its grip
+  const pressX = () => { step([src("left", [0, 1, 0], [4]), src("right", [0.3, 1, 0])]); step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])]); };
+  pressX();
+  assert.strictEqual(ctx("core.arms"), "l");
+  sent.length = 0;
+  for (let i = 0; i <= 6; i++) step([src("left", [0, 1, 0]), src("right", [0.3, 1, -0.01 * i], [1])], 2);
+  assert.ok(teleops().length > 0 && teleops().every((m) => m.mask.join() === "0,0,0"), "left-only: right grip ignored");
+  pressX();
+  assert.strictEqual(ctx("core.arms"), "r");
+  sent.length = 0;
+  for (let i = 0; i <= 6; i++) step([src("left", [0, 1, 0], [1]), src("right", [0.3, 1, 0])], 2);
+  assert.ok(teleops().every((m) => m.mask[0] === 0), "right-only: left grip ignored");
+  sent.length = 0;
+  for (let i = 0; i <= 6; i++) step([src("left", [0, 1, 0]), src("right", [0.3, 1, -0.01 * i], [1])], 2);
+  assert.ok(teleops().some((m) => m.mask.join() === "0,1,0"), "right-only: right grip drives the right arm");
+  pressX();
+  assert.strictEqual(ctx("core.arms"), "both");
+  assert.strictEqual(el("opt-arms").value, "both", "settings dropdown follows the headset toggle");
+  console.log("ok  A/X cycles both -> left only -> right only; unselected arm ignores its grip");
+
+  // B/Y: a tap only freezes; holding it 1 s sends one E-STOP
+  sent.length = 0;
+  step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0], [5])], 3);       // ~40 ms tap
+  step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])], 3);
+  assert.ok(sent.some((m) => m.type === "teleop_stop") && !sent.some((m) => m.type === "estop"), "tap: freeze only");
+  sent.length = 0;
+  step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0], [5])], 60);      // ~0.84 s: not yet
+  assert.ok(!sent.some((m) => m.type === "estop"), "no E-STOP before 1 s");
+  step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0], [5])], 40);      // past 1 s, still held
+  assert.strictEqual(sent.filter((m) => m.type === "estop").length, 1, "exactly one E-STOP after holding 1 s");
+  step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])], 2);
+  console.log("ok  B/Y tap = freeze only; holding 1 s sends a single E-STOP");
 
   sent.length = 0;
   session.ev.end();

@@ -27,13 +27,16 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import ssl
 import subprocess
 import threading
 import time
 import argparse
 
+import tornado.httpserver
 import tornado.ioloop
+import tornado.netutil
 import tornado.web
 import tornado.websocket
 import tornado.gen
@@ -52,7 +55,7 @@ WEB_DIR = os.path.join(HERE, "web")
 # Commands each listener may forward to the bridge.
 DASHBOARD_CMDS = ("arm_engage", "arm_release", "estop", "arm_weight", "arm_speed",
                   "arm_set", "loco", "traj", "traj_stop", "teleop_stop")
-QUEST_CMDS = ("teleop", "teleop_stop")
+QUEST_CMDS = ("teleop", "teleop_stop", "estop")   # estop: hold B/Y 1 s in the headset
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +363,66 @@ def make_app(page="index.html", cameras=True, **settings):
     return tornado.web.Application(routes, **settings)
 
 
+class QuestListener:
+    """HTTPS server for the Quest page that also answers plain http://.
+
+    The Quest Browser assumes http:// when the scheme is left off, and plain
+    HTTP on a TLS port just dies ("This page isn't working"). So each new
+    connection is peeked: a TLS ClientHello (first byte 0x16) goes to the HTTPS
+    server, anything else gets a 301 to the same URL on https://.
+    """
+
+    def __init__(self, app, ssl_ctx):
+        self.server = tornado.httpserver.HTTPServer(app, ssl_options=ssl_ctx)
+
+    def listen(self, port, address):
+        for sock in tornado.netutil.bind_sockets(port, address=address):
+            tornado.netutil.add_accept_handler(sock, self._accept)
+
+    def _accept(self, conn, addr):
+        loop = tornado.ioloop.IOLoop.current()
+        conn.setblocking(False)
+
+        def give_up():                      # connected but never sent a byte
+            loop.remove_handler(conn)
+            conn.close()
+        timeout = loop.call_later(10, give_up)
+
+        def ready(fd, events):
+            loop.remove_handler(conn)
+            loop.remove_timeout(timeout)
+            try:
+                first = conn.recv(1, socket.MSG_PEEK)
+            except OSError:
+                conn.close()
+                return
+            if first == b"\x16":
+                self.server._handle_connection(conn, addr)  # TLS: normal HTTPS path
+            else:
+                self._redirect(conn)
+        loop.add_handler(conn, ready, loop.READ)
+
+    @staticmethod
+    def _redirect(conn):
+        try:
+            head = conn.recv(8192).decode("latin-1")
+            lines = head.split("\r\n")
+            parts = lines[0].split(" ")
+            path = parts[1] if len(parts) > 1 and parts[1].startswith("/") else "/"
+            host = next((l.split(":", 1)[1].strip() for l in lines[1:]
+                         if l.lower().startswith("host:")), "")
+            if host:
+                resp = ("HTTP/1.1 301 Moved Permanently\r\nLocation: https://%s%s\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n" % (host, path))
+            else:
+                resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            conn.sendall(resp.encode("latin-1"))
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
 def ensure_cert(cert_dir):
     """Self-signed TLS cert for the Quest listener (WebXR needs HTTPS)."""
     cert = os.path.join(cert_dir, "cert.pem")
@@ -443,7 +506,7 @@ def main():
             teleop_key = load_teleop_key(args.teleop_key_file)
             quest = make_app(page="quest.html", cameras=False,
                              teleop_key=teleop_key, commands=QUEST_CMDS)
-            quest.listen(args.https_port, address=args.https_address, ssl_options=ctx)
+            QuestListener(quest, ctx).listen(args.https_port, args.https_address)
             quest_url = "https://<host>:%d/?key=%s" % (args.https_port, teleop_key)
         except Exception as e:
             print("[https] Quest listener disabled:", e)

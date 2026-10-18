@@ -16,7 +16,7 @@
 const TeleopMath = (function () {
   // kin.js globals are top-level consts (not window properties), so name them.
   const kin = (typeof module === "object" && module.exports) ? require("./kin.js")
-    : { ARM_CMD_IDX, ARM_SIDE, ARM12_MIN, ARM12_MAX, computeFK, forearmDir, solveArmIK, checkPose };
+    : { ARM_CMD_IDX, ARM_SIDE, ARM12_MIN, ARM12_MAX, computeFK, forearmDir, solveArmIK, checkMove };
 
   // --- quaternions [x, y, z, w] and vectors ---
   const qMul = (a, b) => [
@@ -61,17 +61,19 @@ const TeleopMath = (function () {
     constructor(opt) {
       this.scale = 0.7;          // robot metres per controller metre
       this.headPitch = false;    // follow headset pitch with the robot head
+      this.arms = "both";        // which arms the controllers may drive: "both" | "l" | "r"
       Object.assign(this, opt || {});
       this.M = operatorFrame([0, 0, 0, 1]);
       this.arm = { l: null, r: null };   // clutch state per side, null = released
       this.out = null;                   // last 12-vector we produced
       this.blocked = { l: false, r: false };
+      this.tgt = { l: null, r: null };   // hand-tip target (robot frame) while clutched, for display
     }
     recenter(headQuat) {
       this.M = operatorFrame(headQuat);
       this.arm.l = this.arm.r = null;    // re-grab after recenter
     }
-    release() { this.arm.l = this.arm.r = null; this.out = null; }
+    release() { this.arm.l = this.arm.r = null; this.out = null; this.tgt = { l: null, r: null }; }
 
     // inp: { q26: measured full state q, qcmd: bridge's 12 commanded q (or null),
     //        head: quat|null, l/r: { pos, quat, grip } | null }
@@ -87,8 +89,9 @@ const TeleopMath = (function () {
 
       for (const side of ["l", "r"]) {
         const c = inp[side], S = kin.ARM_SIDE[side], k0 = S.k0;
-        if (!c || !c.grip) {                       // released: follow the bridge
-          this.arm[side] = null; this.blocked[side] = false;
+        const allowed = this.arms === "both" || this.arms === side;
+        if (!c || !c.grip || !allowed) {           // released (or arm not selected): follow the bridge
+          this.arm[side] = null; this.blocked[side] = false; this.tgt[side] = null;
           for (let k = 0; k < 5; k++) this.out[k0 + k] = ref[k0 + k];
           kin.ARM_CMD_IDX.slice(k0, k0 + 5).forEach((i, k) => (base[i] = ref[k0 + k]));
           continue;
@@ -103,6 +106,7 @@ const TeleopMath = (function () {
         const a = this.arm[side];
         const d = toRobot(this.M, sub(c.pos, a.P0));
         const tgt = [0, 1, 2].map((k) => a.tip0[k] + this.scale * d[k]);
+        this.tgt[side] = tgt;
         // world-frame relative rotation, carried into the robot frame
         const rel = qMul(c.quat, qConj(a.Q0));
         const dir = norm(toRobot(this.M, qRot(rel, fromRobot(this.M, a.dir0))));
@@ -115,7 +119,7 @@ const TeleopMath = (function () {
         const cand = base.slice();
         S.pos.forEach((i) => (cand[i] = sol.q[i]));
         cand[S.wr] = wr;
-        const chk = kin.checkPose(cand);
+        const chk = kin.checkMove(base, cand, side);   // judge only this arm, vs where it is now
         if (chk.ok) {
           S.pos.forEach((i) => (a.seed[i] = sol.q[i]));
           kin.ARM_CMD_IDX.slice(k0, k0 + 5).forEach((i, k) => {

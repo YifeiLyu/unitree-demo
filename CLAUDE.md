@@ -188,15 +188,35 @@ Safety layers, outermost first:
 1. **Key.** The :8443 WebSocket needs `?key=` from `~/magikid_teleop/teleop_key`
    (8 random characters, made on first start). Without it the upgrade gets a 403.
    The relay puts this port on the Mac's Wi-Fi, so the key matters.
-2. **Whitelist.** :8443 may only send `teleop` and `teleop_stop`. Engaging,
-   motions and release are dashboard-only, so someone at the Mac has to engage first.
-3. **Page.** `TeleopCore` runs `checkPose` on every IK result and keeps the last
-   safe target instead. Refused poses are ones where a forearm comes within
+2. **Whitelist.** :8443 may only send `teleop`, `teleop_stop` and `estop`
+   (stopping is always allowed). Engaging and motions are dashboard-only, so
+   someone at the Mac has to engage first.
+3. **Page.** `TeleopCore` runs `checkMove(before, after, side)` on every IK
+   result and keeps the last safe target instead. The limits: a forearm within
    10 cm of the other forearm, within 15 cm of the head centre, into the torso
-   box, or below the mounting surface. The limits are in `BODY` in `kin.js`; they
-   come from the STL bounding boxes and allow for the 3.6 cm forearm radius.
+   box, or below `floorZ`. They are in `BODY` in `kin.js`, taken from the STL
+   bounding boxes with the 3.6 cm forearm radius allowed for. Two rules matter:
+   - **Only the moving arm is judged.** The untouched arm never blocks it.
+   - **A limit already broken only stops it getting worse.** The robot's own
+     resting pose (arms hanging, lowest point z ≈ 0.006) is below `floorZ`
+     (0.030), so an arm starting there may move up or sideways but not lower.
+   `checkPose` (whole pose, absolute) is still used by the tests.
 4. **Bridge.** URDF clamping, a velocity cap of at most 1.0 rad/s, a 0.3 s
    watchdog, and head yaw is never commanded.
+
+**In-headset view.** A dark "stage" (front-left, so the middle stays clear to
+see the real robot) shows **YOU**, a figure built from the headset and
+controller poses (shoulders and elbows estimated, `drawHuman`), next to
+**ROBOT**: gray = measured pose, green = target, and a ball where your hand
+is asking the robot hand to go (`TeleopCore.tgt`). A white line from the hand
+to the ball means the robot can't reach it, and a red ball means the pose was
+refused. Bones are cylinders, because WebGL lines are 1 px. The status panel
+sits front-right. Both can be dragged with the trigger.
+
+**Preview.** While the arms are not engaged, the grips still drive the green
+target, but nothing is sent ("PREVIEW" on the panel, yellow cone). When
+the arms become engaged, `core.release()` throws the preview pose away, so the
+robot never jumps to it.
 
 Mapping (`teleop.js`): holding a grip makes that hand move the robot hand tip
 relative to where the grip started, times the hand scale (0.7 by default).
@@ -204,7 +224,12 @@ Controller rotation turns the forearm direction (low weight in the IK), and the
 twist about the pointing axis drives wrist roll. "Forward" is the operator's
 horizontal facing when they enter or click a thumbstick, and the operator is
 assumed to face the same way as the robot. Buttons (xr-standard indices):
-squeeze `[1]` = clutch, B/Y `[5]` = freeze, thumbstick press `[3]` = recentre.
+squeeze `[1]` = clutch, trigger `[0]` = drag the status panel or the stage (by its backdrop)
+(ray hit-test; thumbstick axis `[3]` pushes it farther or pulls it closer while
+dragging), A/X `[4]` = cycle arms (both / left only / right only, also in the
+page settings), B/Y `[5]` tap = freeze (`teleop_stop`, hold pose), B/Y held
+1 s = `estop` (release, same as the dashboard E-STOP), thumbstick press `[3]` = recentre. Page
+settings are remembered in the headset's localStorage (`magikid.quest.v1`).
 Head pitch follows the headset only when that option is ticked.
 
 The robot's reach is small: home already has the hand near full forward

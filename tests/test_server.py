@@ -5,6 +5,7 @@ commands each listener is allowed to forward.
 
     python3 tests/test_server.py
 """
+import http.client
 import json
 import os
 import shutil
@@ -90,6 +91,10 @@ async def main(tmp):
     assert "got teleop_stop" in logs(await collect(dash, 0.6))
     print("ok  teleop_stop forwarded")
 
+    quest.write_message(json.dumps({"type": "estop"}))
+    assert "got estop" in logs(await collect(dash, 0.6))
+    print("ok  Quest E-STOP (hold B/Y) forwarded")
+
     ctx = ssl.create_default_context()
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     page = urllib.request.urlopen("https://127.0.0.1:%d/" % HTTPS, context=ctx).read().decode()
@@ -102,6 +107,12 @@ async def main(tmp):
             raise AssertionError("Quest listener serves /" + f)
         except urllib.error.HTTPError as e:
             assert e.code == 404, e.code
+    # plain http:// on the HTTPS port (Quest Browser default) -> 301 to https://
+    conn = http.client.HTTPConnection("127.0.0.1", HTTPS, timeout=5)
+    conn.request("GET", "/?key=abc")
+    r = conn.getresponse()
+    assert r.status == 301 and r.getheader("Location") == "https://127.0.0.1:%d/?key=abc" % HTTPS, (r.status, r.getheader("Location"))
+    print("ok  http:// on the Quest port redirects to https://")
     dash_page = urllib.request.urlopen("http://127.0.0.1:%d/" % HTTP).read().decode()
     assert "kin.js" in dash_page and "app.js" in dash_page
     print("ok  HTTPS / serves quest.html and its scripts, not the cameras; HTTP / serves the dashboard")

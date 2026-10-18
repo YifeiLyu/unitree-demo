@@ -40,12 +40,19 @@
       </div>
       <p class="q-err hidden" id="key-err">Could not connect. Open this page with the URL printed by
         <code>scripts/quest_tunnel.sh</code> (it ends in <code>?key=…</code>).</p>
-      <p class="q-note" id="engage-note">Engage the arms on the dashboard first (ARM CONTROL → Engage). The headset can't engage them.</p>
+      <p class="q-note" id="engage-note">Not engaged: in the headset the grips only move the green preview model.
+        To move the robot, engage the arms on the dashboard (ARM CONTROL → Engage). The headset can't engage them.</p>
     </section>
 
     <section class="card">
       <div class="card-head"><h2>Settings</h2><span class="hint">change before entering</span></div>
       <div class="q-row">
+        <label>Arms
+          <select id="opt-arms">
+            <option value="both" selected>Both arms</option>
+            <option value="l">Left arm only</option>
+            <option value="r">Right arm only</option>
+          </select></label>
         <label>Hand scale
           <select id="opt-scale">
             <option value="0.5">0.5×</option>
@@ -76,8 +83,11 @@
         <li>Stand <b>behind the robot, facing the same way</b>. Your forward is captured on entering.</li>
         <li><b>Hold a grip</b> to move that arm. The robot hand follows your hand <b>relative</b> to where you grabbed. Twist the controller to roll the wrist.</li>
         <li><b>Let go</b> and the arm stays put. Grab again somewhere comfortable to keep going.</li>
-        <li><b>B or Y</b> = FREEZE: both arms hold immediately. Release both grips, then grab again to resume.</li>
+        <li><b>A or X</b> = switch arms: both → left only → right only. The arm that is not selected stays where it is.</li>
+        <li><b>B or Y</b> (tap) = FREEZE: both arms hold immediately. Release both grips, then grab again to resume.</li>
+        <li><b>Hold B or Y for 1 second</b> = E-STOP, same as the dashboard: the robot lets go of the arms (be ready to support them). Re-engage on the dashboard afterwards.</li>
         <li><b>Click a thumbstick</b> = re-centre forward to where you are looking.</li>
+        <li><b>Point at the status panel or the green robot model and hold the trigger</b> to drag it. While dragging, push the thumbstick forward/back to move it farther/closer.</li>
         <li>Poses that would hit the body, the head, the other hand or the base are refused (the controller buzzes). The dashboard E-STOP still works.</li>
       </ul>
     </section>

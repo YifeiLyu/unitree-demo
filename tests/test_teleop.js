@@ -137,6 +137,42 @@ test("unsafe targets (hands meeting, too low, into torso) are refused; output st
   }
 });
 
+test("arms option: 'l' ignores the right grip, 'r' ignores the left grip", () => {
+  const mv = (side, n) => Array.from({ length: n + 1 }, (_, i) => ({ [side]: { pos: [0, 1, -0.005 * i], quat: ID, grip: true }, head: ID }));
+  const onlyL = run(new T.TeleopCore({ arms: "l" }), mv("r", 10));
+  assert.deepStrictEqual(onlyL.mask, [0, 0, 0]);
+  assert.deepStrictEqual(onlyL.q, READY);
+  const onlyR = run(new T.TeleopCore({ arms: "r" }), mv("r", 10));
+  assert.deepStrictEqual(onlyR.mask, [0, 1, 0]);
+  const onlyR2 = run(new T.TeleopCore({ arms: "r" }), mv("l", 10));
+  assert.deepStrictEqual(onlyR2.mask, [0, 0, 0]);
+});
+
+test("robot's real resting pose (both arms below floorZ): right-only arm can move up, not lower; left never blocks it", () => {
+  // measured on the robot 2026-10-18 with the arms hanging (lowest point z = 0.006 < floorZ)
+  const REST = [-0.62, -0.03, 0, 0.69, 0.01, -0.61, 0.06, 0.04, 0.66, 0.01, 0, 0];
+  assert.ok(!K.checkPose(to26(REST)).ok, "precondition: rest pose breaks the floor limit");
+  const minZ = (q12, s) => K.poseMetrics(to26(q12))[s].minZ;
+  const drive = (dy) => {
+    const core = new T.TeleopCore({ arms: "r" }), warned = new Set();
+    let out;
+    for (let i = 0; i <= 14; i++) {
+      out = core.update({ q26: to26(REST), qcmd: null, head: ID, r: { pos: [0, 1 + dy * i / 14, 0], quat: ID, grip: true } });
+      out.warn.forEach((w) => warned.add(w));
+    }
+    return { out, warned: [...warned] };
+  };
+  const up = drive(0.07);
+  assert.deepStrictEqual(up.out.mask, [0, 1, 0]);
+  assert.ok(minZ(up.out.q, "r") > minZ(REST, "r") + 0.03, "right hand went up");
+  assert.ok(!up.warned.some((w) => /left/.test(w)), "left arm never mentioned: " + up.warned);
+  assert.deepStrictEqual(up.out.q.slice(0, 5), REST.slice(0, 5), "left arm untouched");
+  const down = drive(-0.07);
+  assert.ok(down.warned.includes("right arm too low"), "going lower is refused: " + down.warned);
+  assert.ok(minZ(down.out.q, "r") >= minZ(REST, "r") - 1e-3, "never lower than where it started");
+  console.log("    up: right hand +" + cm(minZ(up.out.q, "r") - minZ(REST, "r")) + "; down: refused (" + down.warned.join("; ") + ")");
+});
+
 test("head pitch follows the headset only when enabled, head yaw never", () => {
   const down = qAxis([1, 0, 0], -0.3);       // looking 0.3 rad down
   const off = run(new T.TeleopCore(), [{ head: down }]);

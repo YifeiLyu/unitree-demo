@@ -163,6 +163,34 @@ function forearmPts(F, side) {
   return [f.p, addLocal(f, [0.07, 0, 0]), addLocal(f, [0.14, 0, 0])];
 }
 function inBox(p, b) { return p[0] > b.min[0] && p[0] < b.max[0] && p[1] > b.min[1] && p[1] < b.max[1] && p[2] > b.min[2] && p[2] < b.max[2]; }
+// Clearance numbers of one pose: forearm-to-forearm distance, and per arm the
+// lowest point, distance to the head centre, and whether a forearm is in the torso.
+function poseMetrics(q26) {
+  const F = computeFK(q26);
+  const L = forearmPts(F, "l"), R = forearmPts(F, "r");
+  const headC = F.h_y.p.map((v, k) => (v + F.h_top.p[k]) / 2);
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  let hands = Infinity; for (const a of L) for (const b of R) hands = Math.min(hands, dist(a, b));
+  const arm = (side, pts) => ({
+    minZ: Math.min(...pts.concat([F[side + "_el"].p]).map((p) => p[2])),
+    head: Math.min(...pts.map((p) => dist(p, headC))),
+    torso: pts.some((p) => inBox(p, BODY.torso)),
+  });
+  return { hands, l: arm("l", L), r: arm("r", R) };
+}
+// Is moving `side` from pose `before` to `after` acceptable? Only that arm is
+// judged, and a limit it already breaks only stops it from getting WORSE: the
+// robot's own resting pose sits below floorZ, and the other, untouched arm must
+// never block this one. Returns { ok, warn[] }.
+function checkMove(before26, after26, side) {
+  const b = poseMetrics(before26), a = poseMetrics(after26), eps = 1e-4;
+  const name = side === "l" ? "left" : "right", A = a[side], B = b[side], warn = [];
+  if (a.hands < BODY.handsMin && a.hands < b.hands - eps) warn.push("hands " + (a.hands * 100).toFixed(0) + " cm apart");
+  if (A.head < BODY.headMin && A.head < B.head - eps) warn.push(name + " hand near head");
+  if (A.torso && !B.torso) warn.push(name + " forearm into torso");
+  if (A.minZ < BODY.floorZ && A.minZ < B.minZ - eps) warn.push(name + " arm too low");
+  return { ok: !warn.length, warn };
+}
 // Self-collision / workspace check of one full pose. Returns { ok, warn[] }.
 function checkPose(q26) {
   const F = computeFK(q26);
@@ -185,5 +213,5 @@ function checkPose(q26) {
 
 if (typeof module === "object" && module.exports) {
   module.exports = { IDX, ARM_CMD_IDX, KIN, ARM12_MIN, ARM12_MAX, ARM_SIDE, BODY,
-    computeFK, addLocal, mVec, forearmDir, forearmPts, solveArmIK, checkPose, limit26 };
+    computeFK, addLocal, mVec, forearmDir, forearmPts, solveArmIK, checkPose, checkMove, poseMetrics, limit26 };
 }

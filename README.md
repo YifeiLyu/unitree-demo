@@ -73,10 +73,19 @@ Drive both arms by hand from a Quest, in passthrough so you can see the robot.
 | Control | Action |
 |---|---|
 | Hold **grip** | That robot arm follows your hand, relative to where you grabbed. Twist to roll the wrist. Let go and the arm holds. |
-| **B / Y** | FREEZE both arms. Release both grips and grab again to resume. |
+| Hold **trigger** on the status panel or the dark YOU / ROBOT board | Drag it somewhere else. Push the thumbstick forward or back to move it farther or closer. |
+| **A / X** | Switch arms: both → left only → right only. You can also pick this in the page settings. |
+| **B / Y** (tap) | FREEZE both arms in place. Release both grips and grab again to resume. |
+| Hold **B / Y** for 1 s | **E-STOP**, same as the dashboard: the robot lets go of the arms, so be ready to support them. Re-engage on the dashboard. |
 | Thumbstick **click** | Re-centre "forward" to where you're looking. |
 
-Stand behind the robot, facing the same way it faces. The page refuses
+A dark board on your front-left shows **YOU**, a figure that copies your head
+and hands, next to **ROBOT**: gray is where the robot is, green is where it
+will move, and a ball marks where your hand is asking it to go. A white line
+means the robot can't reach that far, and a red ball means the pose is
+blocked. Before you engage, the grips only move the green target ("PREVIEW"
+on the panel), so you can practise without the robot moving. Stand behind
+the robot, facing the same way it faces. The page refuses
 poses that would hit the robot's body, its head, the other arm or the base,
 and the controller buzzes when that happens. If the headset or Wi-Fi drops,
 the bridge holds the arms after 0.3 s. The dashboard E-STOP still works.
@@ -95,7 +104,7 @@ the bridge holds the arms after 0.3 s. The dashboard E-STOP still works.
 6. **Head yaw is disabled.** Its sensor offset varies between power-ons, so it
    is never powered or commanded.
 7. **Quest teleop** uses its own HTTPS port. That port needs a key and can
-   only stream arm targets or freeze. Engaging, motions and release stay on
+   only stream arm targets, freeze, or E-STOP. Engaging and motions stay on
    the dashboard.
 
 Verified on hardware: arm control on 2026-10-02, motions on 2026-10-04. Always

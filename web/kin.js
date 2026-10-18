@@ -95,6 +95,9 @@ function limit26(i, v) {
 }
 // Forearm direction = wrist frame +X (the wrist-roll axis).
 function forearmDir(F, side) { const R = F[ARM_SIDE[side].wrf].R; return [R[0][0], R[1][0], R[2][0]]; }
+// Upper-arm direction (shoulder -> elbow) = -Z of the shoulder-yaw frame (the yaw
+// joint turns about the upper arm's long axis). At q = 0 it points straight down.
+function upperArmDir(F, side) { const R = F[side + "_sy"].R; return [-R[0][2], -R[1][2], -R[2][2]]; }
 
 // Damped least squares on the 4 position joints: move the hand tip to `tgt`
 // and (weighted by dirW) point the forearm along unit vector `dir`.
@@ -131,6 +134,37 @@ function solveArmIK(q26, side, tgt, dir, opt) {
     F = computeFK(q); e = resid(F);
   }
   return { q, err: Math.hypot(e[0], e[1], e[2]) };
+}
+// Whole-arm retargeting: point the robot's upper arm along unit vector `up` and
+// its forearm along unit vector `fore` (both robot frame). 4 joints, 2 directions.
+// Damped least squares from the seed q26 (not modified). Returns { q, err } where
+// err is the summed direction error (|du| + |df|).
+function solveArmDirIK(q26, side, up, fore, opt) {
+  const o = Object.assign({ iters: 15, lambda: 0.05, maxStep: 0.2 }, opt || {});
+  const S = ARM_SIDE[side], q = q26.slice(), h = 1e-4;
+  const resid = (F) => {
+    const u = upperArmDir(F, side), f = forearmDir(F, side);
+    return [up[0]-u[0], up[1]-u[1], up[2]-u[2], fore[0]-f[0], fore[1]-f[1], fore[2]-f[2]];
+  };
+  const errOf = (e) => Math.hypot(e[0], e[1], e[2]) + Math.hypot(e[3], e[4], e[5]);
+  let e = resid(computeFK(q));
+  for (let it = 0; it < o.iters && errOf(e) > 1e-4; it++) {
+    const J = S.pos.map((i) => {
+      const qq = q.slice(); qq[i] += h;
+      const e2 = resid(computeFK(qq));
+      return e.map((v, r) => (v - e2[r]) / h);
+    });
+    const A = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]], b = [0,0,0,0];
+    for (let a = 0; a < 4; a++) {
+      for (let c = 0; c < 4; c++) { let t = 0; for (let r = 0; r < 6; r++) t += J[a][r] * J[c][r]; A[a][c] = t; }
+      A[a][a] += o.lambda * o.lambda;
+      let t = 0; for (let r = 0; r < 6; r++) t += J[a][r] * e[r]; b[a] = t;
+    }
+    const dq = solve4(A, b);
+    S.pos.forEach((i, a) => { q[i] = limit26(i, q[i] + Math.max(-o.maxStep, Math.min(o.maxStep, dq[a]))); });
+    e = resid(computeFK(q));
+  }
+  return { q, err: errOf(e) };
 }
 function solve4(A, b) {               // Gaussian elimination, partial pivoting
   const M = A.map((row, i) => row.concat([b[i]]));
@@ -213,5 +247,6 @@ function checkPose(q26) {
 
 if (typeof module === "object" && module.exports) {
   module.exports = { IDX, ARM_CMD_IDX, KIN, ARM12_MIN, ARM12_MAX, ARM_SIDE, BODY,
-    computeFK, addLocal, mVec, forearmDir, forearmPts, solveArmIK, checkPose, checkMove, poseMetrics, limit26 };
+    computeFK, addLocal, mVec, forearmDir, upperArmDir, forearmPts, solveArmIK, solveArmDirIK,
+    checkPose, checkMove, poseMetrics, limit26 };
 }

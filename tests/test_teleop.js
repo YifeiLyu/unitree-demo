@@ -183,4 +183,83 @@ test("head pitch follows the headset only when enabled, head yaw never", () => {
   assert.strictEqual(on.q[11], 0);
 });
 
+// --- whole-arm mode (WebXR body tracking) ---
+// A person facing XR -Z (same way as the robot), shoulders 40 cm apart.
+const BODY0 = { lsh: [-0.2, 1.4, 0], rsh: [0.2, 1.4, 0], hips: [0, 0.9, 0], chest: [0, 1.3, 0] };
+// Build tracked joints whose arm SHAPE equals robot pose q12 (upper arm 30 cm, forearm 27 cm).
+function bodyFor(q12, frame) {
+  const F = K.computeFK(to26(q12)), Bf = frame || T.bodyFrame(BODY0), b = Object.assign({}, BODY0);
+  for (const s of ["l", "r"]) {
+    const u = T.fromRobot(Bf, K.upperArmDir(F, s)), f = T.fromRobot(Bf, K.forearmDir(F, s));
+    const sh = s === "l" ? b.lsh : b.rsh, el = sh.map((v, i) => v + 0.30 * u[i]), wr = el.map((v, i) => v + 0.27 * f[i]);
+    b[s] = { sh, el, wr };
+  }
+  return b;
+}
+const dirErr = (qa, qb, s) => {
+  const A = K.computeFK(to26(qa)), B = K.computeFK(to26(qb));
+  const d = (x, y) => Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2]);
+  return d(K.upperArmDir(A, s), K.upperArmDir(B, s)) + d(K.forearmDir(A, s), K.forearmDir(B, s));
+};
+
+test("body frame: a person facing XR -Z gives forward -Z, left -X, up +Y", () => {
+  const B = T.bodyFrame(BODY0);
+  assert.deepStrictEqual(B.map((r) => r.map((v) => Math.round(v) + 0)), [[0, 0, -1], [-1, 0, 0], [0, 1, 0]]);
+});
+
+test("arm mode: gripping makes the robot arm take the shape of your arm", () => {
+  const goal = [-1.0, 0.4, 0.2, 0.6, 0, -0.6, -0.3, 0, -0.2, 0, 0, 0];     // left arm raised forward/out
+  assert.ok(K.checkPose(to26(goal)).ok);
+  const core = new T.TeleopCore({ mode: "arm", arms: "l" });
+  let out;
+  for (let i = 0; i < 6; i++)
+    out = core.update({ q26: to26(READY), qcmd: READY, head: ID, l: { pos: [0, 1, 0], quat: ID, grip: true }, body: bodyFor(goal) });
+  assert.deepStrictEqual(out.mask, [1, 0, 0]);
+  const e = dirErr(out.q, goal, "l");
+  console.log("    arm-shape error after 6 frames: " + e.toFixed(4) + " (upper arm + forearm direction)");
+  assert.ok(e < 0.02, "arm shape matched");
+  assert.deepStrictEqual(out.q.slice(5, 10), READY.slice(5, 10), "right arm untouched");
+});
+
+test("arm mode: not gripping -> nothing sent, but the preview shows where your arm maps to", () => {
+  const goal = [-1.0, 0.4, 0.2, 0.6, 0, -0.6, -0.3, 0, -0.2, 0, 0, 0];
+  const core = new T.TeleopCore({ mode: "arm" });
+  let out;
+  for (let i = 0; i < 6; i++) out = core.update({ q26: to26(READY), qcmd: READY, head: ID, body: bodyFor(goal) });
+  assert.deepStrictEqual(out.mask, [0, 0, 0]);
+  assert.deepStrictEqual(out.q, READY);
+  assert.ok(dirErr(core.displayQ(out.q), goal, "l") < 0.02, "preview pose matches your arm");
+});
+
+test("arm mode: turning your whole body doesn't move the robot (torso frame, not world)", () => {
+  const goal = [-1.0, 0.4, 0.2, 0.6, 0, -0.6, -0.3, 0, -0.2, 0, 0, 0];
+  const turn = (p) => [p[0] * Math.cos(0.8) + p[2] * Math.sin(0.8), p[1], -p[0] * Math.sin(0.8) + p[2] * Math.cos(0.8)];
+  const b = bodyFor(goal), tb = {};
+  for (const k of ["lsh", "rsh", "hips", "chest"]) tb[k] = turn(b[k]);
+  for (const s of ["l", "r"]) tb[s] = { sh: turn(b[s].sh), el: turn(b[s].el), wr: turn(b[s].wr) };
+  const core = new T.TeleopCore({ mode: "arm", arms: "l" });
+  let out;
+  for (let i = 0; i < 6; i++) out = core.update({ q26: to26(READY), qcmd: READY, head: ID, l: { pos: [0, 1, 0], quat: ID, grip: true }, body: tb });
+  assert.ok(dirErr(out.q, goal, "l") < 0.02, "same arm shape after turning 46 deg");
+});
+
+test("arm mode: no body data while gripping -> warns and holds; unsafe shapes are refused", () => {
+  const core = new T.TeleopCore({ mode: "arm" });
+  const o1 = core.update({ q26: to26(READY), qcmd: READY, head: ID, l: { pos: [0, 1, 0], quat: ID, grip: true }, body: null });
+  assert.deepStrictEqual(o1.mask, [0, 0, 0]);
+  assert.ok(o1.warn.includes("no body tracking"));
+  // both forearms pointing across the chest at each other -> hands meet -> refused, output stays safe
+  const cross = [-1.2, -0.2, -1.2, 0.9, 0, -1.2, 0.2, 1.2, 0.9, 0, 0, 0];
+  const c2 = new T.TeleopCore({ mode: "arm" });
+  const warned = new Set();
+  let out;
+  for (let i = 0; i < 10; i++) {
+    out = c2.update({ q26: to26(READY), qcmd: READY, head: ID, l: { pos: [0, 1, 0], quat: ID, grip: true },
+                      r: { pos: [0.3, 1, 0], quat: ID, grip: true }, body: bodyFor(cross) });
+    out.warn.forEach((w) => warned.add(w));
+  }
+  assert.ok(K.checkPose(to26(out.q)).ok, "output stays safe");
+  console.log("    crossing arms: " + ([...warned].join("; ") || "no warning"));
+});
+
 console.log(n + " tests passed");

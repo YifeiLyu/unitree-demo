@@ -23,9 +23,11 @@ when the browser explicitly sends them, and the bridge stays inert (weight 0)
 until an explicit engage. See magikid_bridge.cpp.
 """
 
+import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -342,24 +344,56 @@ class MetaHandler(tornado.web.RequestHandler):
         })
 
 
+# Local .js/.css references in a page, e.g. src="quest.js" or href="style.css".
+ASSET_REF = re.compile(r'(src|href)="(?!https?:|//)([^"?#]+\.(?:js|css))"')
+
+
+def file_hash(name, _cache={}):
+    """Short content hash of a file under web/ (cached by mtime + size)."""
+    path = os.path.join(WEB_DIR, name)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "missing"
+    key = (path, st.st_mtime, st.st_size)
+    if key not in _cache:
+        with open(path, "rb") as f:
+            _cache[key] = hashlib.md5(f.read()).hexdigest()[:8]
+    return _cache[key]
+
+
 class IndexHandler(tornado.web.RequestHandler):
+    """Serves a page with its scripts/styles versioned by content (x.js?v=hash),
+    so a browser (the Quest's especially) can never run stale code after a
+    deploy. The page itself is never cached; __BUILD__ becomes a build id."""
+
     def initialize(self, page="index.html"):
         self.page = page
 
     def get(self):
-        self.render_from_file(self.page)
+        with open(os.path.join(WEB_DIR, self.page)) as f:
+            html = f.read()
+        refs = sorted(set(m.group(2) for m in ASSET_REF.finditer(html)))
+        build = hashlib.md5("".join(file_hash(r) for r in [self.page] + refs).encode()).hexdigest()[:7]
+        html = ASSET_REF.sub(lambda m: '%s="%s?v=%s"' % (m.group(1), m.group(2), file_hash(m.group(2))), html)
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.set_header("Cache-Control", "no-store")
+        self.write(html.replace("__BUILD__", build))
 
-    def render_from_file(self, name):
-        with open(os.path.join(WEB_DIR, name), "rb") as f:
-            self.set_header("Content-Type", "text/html; charset=utf-8")
-            self.write(f.read())
+
+class StaticHandler(tornado.web.StaticFileHandler):
+    """?v= URLs are cached for good (tornado's default); anything else must revalidate."""
+
+    def set_extra_headers(self, path):
+        if "v" not in self.request.arguments:
+            self.set_header("Cache-Control", "no-cache")
 
 
 def make_app(page="index.html", cameras=True, **settings):
     routes = [(r"/", IndexHandler, {"page": page}), (r"/ws", StateWSHandler)]
     if cameras:  # the Quest listener is on Wi-Fi with no key on these: leave them off
         routes += [(r"/cam/(\d+)", MjpegHandler), (r"/api/meta", MetaHandler)]
-    routes.append((r"/(.*)", tornado.web.StaticFileHandler, {"path": WEB_DIR}))
+    routes.append((r"/(.*)", StaticHandler, {"path": WEB_DIR}))
     return tornado.web.Application(routes, **settings)
 
 

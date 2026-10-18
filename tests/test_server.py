@@ -99,6 +99,19 @@ async def main(tmp):
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     page = urllib.request.urlopen("https://127.0.0.1:%d/" % HTTPS, context=ctx).read().decode()
     assert "quest.js" in page
+    # scripts are versioned by content and the page is never cached (no stale code on the Quest)
+    import re as _re
+    resp = urllib.request.urlopen("https://127.0.0.1:%d/" % HTTPS, context=ctx)
+    assert resp.headers.get("Cache-Control") == "no-store", resp.headers.get("Cache-Control")
+    html = resp.read().decode()
+    vers = dict(_re.findall(r'src="([a-z0-9_/.]+\.js)\?v=([0-9a-f]{8})"', html))
+    assert set(vers) >= {"kin.js", "teleop.js", "quest.js", "vendor/three.min.js"}, vers
+    import hashlib as _h
+    assert vers["quest.js"] == _h.md5(open(os.path.join(ROOT, "web", "quest.js"), "rb").read()).hexdigest()[:8]
+    assert "__BUILD__" not in html and _re.search(r'data-build="[0-9a-f]{7}"', html)
+    plain = urllib.request.urlopen("https://127.0.0.1:%d/quest.js" % HTTPS, context=ctx)
+    assert plain.headers.get("Cache-Control") == "no-cache", plain.headers.get("Cache-Control")
+    print("ok  page: no-store, scripts as x.js?v=<content hash>, build id stamped; bare .js must revalidate")
     for f in ("kin.js", "teleop.js", "quest.js", "vendor/three.min.js"):
         assert urllib.request.urlopen("https://127.0.0.1:%d/%s" % (HTTPS, f), context=ctx).status == 200
     for f in ("cam/0", "api/meta"):

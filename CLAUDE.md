@@ -213,6 +213,23 @@ to the ball means the robot can't reach it, and a red ball means the pose was
 refused. Bones are cylinders, because WebGL lines are 1 px. The status panel
 sits front-right. Both can be dragged with the trigger.
 
+**Whole-arm mode** (setting "Tracking → Whole arm"). This uses WebXR body
+tracking in the Quest Browser: optional feature `body-tracking`, read from
+`frame.body.get("left-arm-upper" | "left-arm-lower" | "left-hand-wrist" | "chest" | "hips" | …)`
+via `frame.getPose`. The Quest provides `frame.body` even though it doesn't
+list the feature in `enabledFeatures`. `bodyFrame()` builds your torso frame
+from the shoulders and hips→chest, so turning your body doesn't move the robot.
+`solveArmDirIK` (kin.js) then points the robot's upper arm (−Z of the
+shoulder-yaw frame) and forearm (+X of the wrist frame) along yours. That is
+4 joints for 2 directions, and body size doesn't matter. Wrist roll still
+comes from the controller twist. It's an absolute mapping, so each grab starts
+at ≤ 0.25 rad/s for 1.5 s (`SOFT_MS`/`SOFT_VEL` in quest.js). Before you grab,
+the green model previews the pose your arm maps to (`TeleopCore.view` /
+`displayQ`). With no body data, a gripped arm just holds ("no body tracking").
+Quest 3/3S can track elbows with the cameras (IOBT), but whether the browser
+uses that or only infers elbows from head + hands is untested. To check: keep
+the hand still, move the elbow, and see whether YOU's elbow follows.
+
 **Preview.** While the arms are not engaged, the grips still drive the green
 target, but nothing is sent ("PREVIEW" on the panel, yellow cone). When
 the arms become engaged, `core.release()` throws the preview pose away, so the

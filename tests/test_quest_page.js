@@ -22,7 +22,7 @@ function el(id) {
     addEventListener(ev, fn) { this.handlers[ev] = fn; },
   });
 }
-el("opt-scale").value = "0.7"; el("opt-speed").value = "0.7"; el("opt-arms").value = "both";
+el("opt-scale").value = "0.7"; el("opt-speed").value = "0.7"; el("opt-arms").value = "both"; el("opt-track").value = "hand";
 const ctx2d = new Proxy({}, { get: () => () => {} });
 const docHandlers = {};
 const document = {
@@ -65,10 +65,12 @@ function pad(pressed) { return { buttons: [0, 1, 2, 3, 4, 5].map((i) => ({ press
 function src(hand, pos, pressed, quat) {
   return { handedness: hand, targetRaySpace: { pos, quat: quat || [0, 0, 0, 1] }, gamepad: pad(pressed || []) };
 }
+let bodyJoints = null;            // name -> [x, y, z] (XR) when the mock has body tracking
 function frame(sources) {
   session.inputSources = sources;
   return {
     session,
+    body: bodyJoints && { get: (n) => (bodyJoints[n] ? { pos: bodyJoints[n], quat: [0, 0, 0, 1] } : undefined) },
     getViewerPose: () => ({ transform: { position: { x: 0, y: 1.6, z: 0 }, orientation: { x: 0, y: 0, z: 0, w: 1 } } }),
     getPose: (space) => ({ transform: { position: { x: space.pos[0], y: space.pos[1], z: space.pos[2] },
                                         orientation: { x: space.quat[0], y: space.quat[1], z: space.quat[2], w: space.quat[3] } } }),
@@ -219,6 +221,49 @@ const teleops = () => sent.filter((m) => m.type === "teleop");
   assert.strictEqual(sent.filter((m) => m.type === "estop").length, 1, "exactly one E-STOP after holding 1 s");
   step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])], 2);
   console.log("ok  B/Y tap = freeze only; holding 1 s sends a single E-STOP");
+
+  // whole-arm mode with (mock) WebXR body tracking
+  {
+    const ctx1 = (e) => vm.runInContext(e, sandbox);
+    el("opt-track").value = "arm"; el("opt-track").handlers.change();
+    assert.strictEqual(ctx1("core.mode"), "arm");
+    // a person facing -Z; right arm raised forward and out: elbow ahead-right, wrist further ahead and up
+    bodyJoints = { hips: [0, 0.9, 0], chest: [0, 1.3, 0], neck: [0, 1.45, 0],
+      "left-arm-upper": [-0.2, 1.4, 0], "left-arm-lower": [-0.22, 1.1, 0], "left-hand-wrist": [-0.22, 1.05, -0.27],
+      "right-arm-upper": [0.2, 1.4, 0], "right-arm-lower": [0.3, 1.3, -0.25], "right-hand-wrist": [0.33, 1.45, -0.48] };
+    const R = () => [src("left", [-0.22, 1.05, -0.27]), src("right", [0.33, 1.45, -0.48], [1])];
+    sent.length = 0;
+    step(R(), 30);                                          // ~0.4 s of gripping
+    const early = teleops().filter((m) => m.mask[1] === 1);
+    assert.ok(early.length > 0 && early.every((m) => m.vel === 0.25), "first 1.5 s of a grab: soft start at 0.25 rad/s");
+    step(R(), 110);                                         // past 1.5 s
+    const late = teleops().slice(-1)[0];
+    assert.strictEqual(late.vel, 0.7, "then the selected speed");
+    assert.deepStrictEqual(late.mask, [0, 1, 0]);
+    // robot right arm shape == the person's right arm shape (torso frame = robot frame here)
+    const K = require("../web/kin.js");
+    const q = new Array(26).fill(0); late.q.forEach((v, k) => (q[14 + k] = v));
+    const F = K.computeFK(q), nrm = (v) => { const n = Math.hypot(...v); return v.map((x) => x / n); };
+    const B = bodyJoints, toR = (v) => [-v[2], -v[0], v[1]];     // XR -> robot for a person facing -Z
+    const uH = nrm(toR(B["right-arm-lower"].map((v, i) => v - B["right-arm-upper"][i])));
+    const fH = nrm(toR(B["right-hand-wrist"].map((v, i) => v - B["right-arm-lower"][i])));
+    const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    const e = d(K.upperArmDir(F, "r"), uH) + d(K.forearmDir(F, "r"), fH);
+    assert.ok(e < 0.05, "robot right arm copies your arm shape, error " + e.toFixed(3));
+    // YOU figure uses the tracked wrist, not the controller
+    const before = ctx1("human.hand.r.getWorldPosition(new THREE.Vector3())");
+    bodyJoints["right-hand-wrist"] = [0.33, 1.55, -0.48];
+    step(R(), 2);
+    const after = ctx1("human.hand.r.getWorldPosition(new THREE.Vector3())");
+    assert.ok(after.y - before.y > 0.02, "YOU figure follows the tracked wrist");
+    // body tracking lost -> nothing new is commanded for that arm
+    bodyJoints = null; sent.length = 0;
+    step(R(), 10);
+    assert.ok(teleops().every((m) => m.mask[1] === 0), "no body data -> right arm not driven");
+    step([src("left", [0, 1, 0]), src("right", [0.3, 1, 0])], 2);
+    el("opt-track").value = "hand"; el("opt-track").handlers.change();
+    console.log("ok  whole-arm mode: soft start, then copies the tracked arm shape; YOU = tracked skeleton; no body = no drive");
+  }
 
   sent.length = 0;
   session.ev.end();

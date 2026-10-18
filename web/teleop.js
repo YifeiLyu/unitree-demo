@@ -8,6 +8,12 @@
    direction, and its twist about the pointing axis drives the wrist roll.
    Releasing the grip leaves the arm where it is, so you can re-grab and ratchet.
 
+   Whole-arm mode (mode = "arm", WebXR body tracking): while a grip is held,
+   that robot arm takes the SHAPE of your arm instead: its upper arm points
+   where yours does (shoulder -> elbow) and its forearm where yours does
+   (elbow -> wrist), measured in your torso frame, so body size doesn't matter.
+   The wrist roll still comes from the controller's twist.
+
    Frames: WebXR is +X right, +Y up, -Z forward. The robot is +X forward,
    +Y left, +Z up. "Forward" is the operator's horizontal facing, captured at
    session start and on recenter, so stand behind the robot facing the same way. */
@@ -16,7 +22,7 @@
 const TeleopMath = (function () {
   // kin.js globals are top-level consts (not window properties), so name them.
   const kin = (typeof module === "object" && module.exports) ? require("./kin.js")
-    : { ARM_CMD_IDX, ARM_SIDE, ARM12_MIN, ARM12_MAX, computeFK, forearmDir, solveArmIK, checkMove };
+    : { ARM_CMD_IDX, ARM_SIDE, ARM12_MIN, ARM12_MAX, computeFK, forearmDir, solveArmIK, solveArmDirIK, checkMove };
 
   // --- quaternions [x, y, z, w] and vectors ---
   const qMul = (a, b) => [
@@ -51,6 +57,15 @@ const TeleopMath = (function () {
     const s = qLocal[3] < 0 ? -1 : 1;
     return wrapPi(-2 * Math.atan2(s * qLocal[2], s * qLocal[3]));
   }
+  // Torso frame from tracked joints (XR coords), rows = forward, left, up (like M):
+  // left = right shoulder -> left shoulder, up = hips -> chest made square to it.
+  function bodyFrame(b) {
+    const y = norm(sub(b.lsh, b.rsh));
+    let z = b.hips && b.chest ? norm(sub(b.chest, b.hips)) : [0, 1, 0];
+    const k = dot(z, y);
+    z = norm([z[0] - k * y[0], z[1] - k * y[1], z[2] - k * y[2]]);
+    return [cross(y, z), y, z];
+  }
   // Head pitch from the headset: looking down = positive (URDF axis +Y).
   function headPitchFrom(headQuat) {
     const f = qRot(headQuat, [0, 0, -1]);
@@ -62,12 +77,15 @@ const TeleopMath = (function () {
       this.scale = 0.7;          // robot metres per controller metre
       this.headPitch = false;    // follow headset pitch with the robot head
       this.arms = "both";        // which arms the controllers may drive: "both" | "l" | "r"
+      this.mode = "hand";        // "hand": hand tip follows the controller; "arm": whole-arm shape (body tracking)
       Object.assign(this, opt || {});
       this.M = operatorFrame([0, 0, 0, 1]);
       this.arm = { l: null, r: null };   // clutch state per side, null = released
       this.out = null;                   // last 12-vector we produced
       this.blocked = { l: false, r: false };
       this.tgt = { l: null, r: null };   // hand-tip target (robot frame) while clutched, for display
+      this.view = { l: null, r: null };  // arm mode: 4 joint angles your arm maps to now (display)
+      this.armSeed = { l: null, r: null }; // arm mode: last solution, seeds the next frame
     }
     recenter(headQuat) {
       this.M = operatorFrame(headQuat);
@@ -76,7 +94,8 @@ const TeleopMath = (function () {
     release() { this.arm.l = this.arm.r = null; this.out = null; this.tgt = { l: null, r: null }; }
 
     // inp: { q26: measured full state q, qcmd: bridge's 12 commanded q (or null),
-    //        head: quat|null, l/r: { pos, quat, grip } | null }
+    //        head: quat|null, l/r: { pos, quat, grip } | null,
+    //        body: { lsh, rsh, hips, chest, l: { sh, el, wr }, r: {...} } | null  (XR positions) }
     // Returns { q: 12 targets, mask: [left, right, head], warn: [...] }.
     update(inp) {
       const ref = (inp.qcmd && inp.qcmd.length === 12) ? inp.qcmd
@@ -86,14 +105,47 @@ const TeleopMath = (function () {
       const base = inp.q26.slice();
       kin.ARM_CMD_IDX.forEach((i, k) => (base[i] = this.out[k]));
       const mask = [0, 0, 0], warn = [];
+      const B = this.mode === "arm" && inp.body ? bodyFrame(inp.body) : null;
+      this.view = { l: null, r: null };
 
       for (const side of ["l", "r"]) {
         const c = inp[side], S = kin.ARM_SIDE[side], k0 = S.k0;
         const allowed = this.arms === "both" || this.arms === side;
+        // arm mode: solve your arm's shape every frame (shown as a preview), apply it only while gripping
+        let armSol = null;
+        if (this.mode === "arm" && allowed && B && inp.body[side]) {
+          const j = inp.body[side], toR = (v) => [dot(B[0], v), dot(B[1], v), dot(B[2], v)];
+          const seed = base.slice();
+          if (this.armSeed[side]) S.pos.forEach((i, n) => (seed[i] = this.armSeed[side][n]));
+          else kin.ARM_CMD_IDX.slice(k0, k0 + 4).forEach((i, k) => (seed[i] = ref[k0 + k]));
+          armSol = kin.solveArmDirIK(seed, side, norm(toR(sub(j.el, j.sh))), norm(toR(sub(j.wr, j.el))));
+          this.armSeed[side] = S.pos.map((i) => armSol.q[i]);
+          this.view[side] = this.armSeed[side].slice();
+        }
         if (!c || !c.grip || !allowed) {           // released (or arm not selected): follow the bridge
           this.arm[side] = null; this.blocked[side] = false; this.tgt[side] = null;
           for (let k = 0; k < 5; k++) this.out[k0 + k] = ref[k0 + k];
           kin.ARM_CMD_IDX.slice(k0, k0 + 5).forEach((i, k) => (base[i] = ref[k0 + k]));
+          continue;
+        }
+        if (this.mode === "arm") {
+          this.tgt[side] = null;
+          if (!armSol) { warn.push("no body tracking"); continue; }   // hold where it is
+          if (!this.arm[side]) this.arm[side] = { Q0: c.quat.slice(), wr0: ref[k0 + 4] };
+          const a = this.arm[side];
+          const cand = base.slice();
+          S.pos.forEach((i) => (cand[i] = armSol.q[i]));
+          cand[S.wr] = clamp(a.wr0 + twistAboutForward(qMul(qConj(a.Q0), c.quat)),
+                             kin.ARM12_MIN[k0 + 4], kin.ARM12_MAX[k0 + 4]);
+          const chk = kin.checkMove(base, cand, side);
+          if (chk.ok) {
+            kin.ARM_CMD_IDX.slice(k0, k0 + 5).forEach((i, k) => { this.out[k0 + k] = cand[i]; base[i] = cand[i]; });
+            this.blocked[side] = false;
+          } else {
+            this.blocked[side] = true;
+            warn.push(...chk.warn);
+          }
+          mask[side === "l" ? 0 : 1] = 1;
           continue;
         }
         if (!this.arm[side]) {                     // grip just pressed: anchor
@@ -142,9 +194,19 @@ const TeleopMath = (function () {
       this.out[11] = ref[11];                      // head yaw: never commanded
       return { q: this.out.slice(), mask, warn: [...new Set(warn)] };
     }
+    // What to draw as the green target: the commanded pose, plus (arm mode) the
+    // pose your arm maps to for arms you are not gripping yet.
+    displayQ(q12) {
+      const q = q12.slice();
+      for (const side of ["l", "r"]) {
+        const v = this.view[side], k0 = kin.ARM_SIDE[side].k0;
+        if (v && !this.arm[side]) v.forEach((x, n) => (q[k0 + n] = x));
+      }
+      return q;
+    }
   }
 
-  return { TeleopCore, operatorFrame, toRobot, fromRobot, twistAboutForward, headPitchFrom, qMul, qConj, qRot };
+  return { TeleopCore, operatorFrame, bodyFrame, toRobot, fromRobot, twistAboutForward, headPitchFrom, qMul, qConj, qRot };
 })();
 
 if (typeof module === "object" && module.exports) module.exports = TeleopMath;

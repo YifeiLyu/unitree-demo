@@ -10,6 +10,8 @@
 const SEND_MS = 33;                       // ~30 Hz to the bridge
 const $ = (s) => document.querySelector(s);
 const KEY = new URLSearchParams(location.search).get("key") || "";
+// build id the server stamped into the page (shown on the HUD to spot stale code)
+const BUILD = (document.body && document.body.dataset && document.body.dataset.build) || "dev";
 
 let latest = null, engaged = false, everOpen = false;
 let ws = null;
@@ -66,7 +68,7 @@ const stopHold = { l: null, r: null };     // time B/Y went down, per hand
 let estopSentAt = -1e9;
 const prevBtn = { l: [], r: [] };          // previous pressed state per button
 const lastBuzz = { l: 0, r: 0 };
-const hud = { dirty: true, link: false, log: "", warn: [], grip: { l: false, r: false }, hold: 0 };
+const hud = { dirty: true, link: false, log: "", warn: [], grip: { l: false, r: false }, hold: 0, body: false };
 
 const ARMS_LABEL = { both: "both arms", l: "left arm only", r: "right arm only" };
 const SETTINGS_KEY = "magikid.quest.v1";
@@ -74,16 +76,17 @@ function readSettings() {
   core.scale = parseFloat($("#opt-scale").value);
   core.headPitch = $("#opt-head").checked;
   core.arms = $("#opt-arms").value;
+  core.mode = $("#opt-track").value === "arm" ? "arm" : "hand";
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({ scale: $("#opt-scale").value,
-      speed: $("#opt-speed").value, head: $("#opt-head").checked, arms: core.arms }));
+      speed: $("#opt-speed").value, head: $("#opt-head").checked, arms: core.arms, track: core.mode }));
   } catch (_) {}
 }
 function loadSettings() {             // remembered per headset; defaults if storage is unavailable
   try {
     const v = JSON.parse(localStorage.getItem(SETTINGS_KEY));
     if (!v) return;
-    for (const [id, k] of [["#opt-scale", "scale"], ["#opt-speed", "speed"], ["#opt-arms", "arms"]])
+    for (const [id, k] of [["#opt-scale", "scale"], ["#opt-speed", "speed"], ["#opt-arms", "arms"], ["#opt-track", "track"]])
       if ([...$(id).options].some((o) => o.value === v[k])) $(id).value = v[k];
     $("#opt-head").checked = !!v.head;
   } catch (_) {}
@@ -199,7 +202,7 @@ function initStage() {
   reachGap = makeBones(2, 0.004, 0xffffff, 0.6);
   for (const s of ["l", "r"]) handTgt[s] = makeBall(0.018, COLOR[s]);
   human = {
-    torso: makeBones(3, 0.014, COLOR.body, 1), head: makeBall(0.05, COLOR.body),
+    torso: makeBones(4, 0.014, COLOR.body, 1), head: makeBall(0.05, COLOR.body),
     arm: { l: makeBones(2, 0.012, COLOR.l, 1), r: makeBones(2, 0.012, COLOR.r, 1) },
     hand: { l: makeBall(0.024, COLOR.l), r: makeBall(0.024, COLOR.r) },
   };
@@ -248,8 +251,9 @@ function elbowOf(S, Hd, a, side) {
   const pl = Math.hypot(...pole) || 1;
   return [0, 1, 2].map((i) => S[i] + n[i] * (L / 2) + (pole[i] / pl) * h);
 }
-// Your figure from the headset + controllers, in your own frame (same axes as the
-// robot), scaled by HUMAN_SCALE and drawn next to the robot. Shoulders are estimated.
+// Your figure, in your own frame (same axes as the robot), scaled by HUMAN_SCALE and
+// drawn next to the robot. With body tracking it is the TRACKED skeleton (shoulders,
+// elbows, wrists, spine); without it, shoulders and elbows are estimated from the controllers.
 function drawHuman(inp, headP) {
   if (!headP) return;
   const s = HUMAN_SCALE, H = [0, HUMAN_Y, HUMAN_HEAD_Z];
@@ -257,6 +261,29 @@ function drawHuman(inp, headP) {
     const r = TeleopMath.toRobot(core.M, [p[0] - headP[0], p[1] - headP[1], p[2] - headP[2]]);
     return [H[0] + s * r[0], H[1] + s * r[1], H[2] + s * r[2]];
   };
+  human.head.visible = true;
+  human.head.position.set(H[0], H[1], H[2]);
+  const b = inp.body;
+  if (b) {
+    const P = (p, fb) => (p ? rel(p) : fb);
+    const neck = P(b.neck, [H[0], H[1], H[2] - s * 0.12]), chest = P(b.chest, [H[0], H[1], H[2] - s * 0.25]);
+    setBone(human.torso.meshes[0], [H[0], H[1], H[2] - 0.05], neck);
+    setBone(human.torso.meshes[1], neck, chest);
+    setBone(human.torso.meshes[2], chest, P(b.hips, [H[0], H[1], H[2] - s * 0.75]));
+    setBone(human.torso.meshes[3], rel(b.lsh), rel(b.rsh));
+    for (const side of ["l", "r"]) {
+      const j = b[side], arm = human.arm[side], hand = human.hand[side];
+      hand.visible = !!j;
+      if (!j) { arm.meshes.forEach((m) => (m.visible = false)); continue; }
+      const sh = rel(j.sh), el = rel(j.el), wr = rel(j.wr);
+      setBone(arm.meshes[0], sh, el);
+      setBone(arm.meshes[1], el, wr);
+      hand.position.set(wr[0], wr[1], wr[2]);
+      hand.material.color.set(handColor[side]);
+    }
+    return;
+  }
+  human.torso.meshes[3].visible = false;
   const chest = [H[0], H[1], H[2] - s * 0.25], hip = [H[0], H[1], H[2] - s * 0.75];
   const sh = { l: [chest[0], chest[1] + s * 0.19, chest[2]], r: [chest[0], chest[1] - s * 0.19, chest[2]] };
   human.head.visible = true;
@@ -277,7 +304,7 @@ function drawHuman(inp, headP) {
 }
 function updateStage(inp, out, headP) {
   drawRobot(robotLive, with12(inp.q26, ARM_CMD_IDX.map((i) => inp.q26[i])));
-  const F = drawRobot(robotTarget, with12(inp.q26, out.q));
+  const F = drawRobot(robotTarget, with12(inp.q26, core.displayQ(out.q)));
   // where your hand is asking the robot hand to go, and the gap if it can't get there
   ["l", "r"].forEach((s, i) => {
     const t = core.tgt[s], ball = handTgt[s];
@@ -328,10 +355,13 @@ function drawHud() {
   const st = (s) => (core.arms !== "both" && core.arms !== s ? "off"
     : hud.grip[s] ? (core.blocked[s] ? "BLOCKED" : engaged ? "moving" : "preview") : "free");
   line(110, "Left: " + st("l") + "    Right: " + st("r") + "    (" + ARMS_LABEL[core.arms] + ")", "#e7ebf3");
-  line(160, "scale " + core.scale + "×   speed " + speed() + " rad/s   head " + (core.headPitch ? "on" : "off"), "#8b94a7");
+  line(160, (core.mode === "arm" ? "whole arm · body " + (hud.body ? "tracked" : "NOT tracked")
+                                  : "hand · scale " + core.scale + "×") +
+            "   speed " + speed() + "   head " + (core.headPitch ? "on" : "off"), hud.body || core.mode !== "arm" ? "#8b94a7" : "#ffb020");
   c.font = "26px system-ui, sans-serif";
   if (hud.warn.length) line(215, "⚠ " + hud.warn.slice(0, 2).join(", "), "#ffb020");
-  line(268, (hud.log || "").slice(0, 44), "#5c6577");
+  line(268, (hud.log || "").slice(0, 34), "#5c6577");
+  c.textAlign = "right"; c.fillStyle = "#5c6577"; c.fillText("build " + BUILD, W - 24, 268); c.textAlign = "left";
   c.font = "23px system-ui, sans-serif";
   line(330, "grip: move · trigger: drag · A/X: arms · B/Y: freeze (hold: E-STOP)", "#5c6577");
   hudTex.needsUpdate = true;
@@ -342,6 +372,30 @@ function drawHud() {
 /* XR frame loop                                                           */
 /* ---------------------------------------------------------------------- */
 const v3 = (p) => [p.x, p.y, p.z];
+// WebXR body tracking (Quest Browser): the joints we use, read every frame.
+const BODY_JOINTS = { hips: "hips", chest: "chest", neck: "neck",
+  lsh: "left-arm-upper", lel: "left-arm-lower", lwr: "left-hand-wrist",
+  rsh: "right-arm-upper", rel: "right-arm-lower", rwr: "right-hand-wrist" };
+function readBody(frame, ref) {
+  const body = frame.body;
+  if (!body || typeof body.get !== "function") return null;
+  const p = {};
+  for (const [k, name] of Object.entries(BODY_JOINTS)) {
+    const sp = body.get(name);
+    if (!sp) continue;
+    let pose = null;
+    try { pose = frame.getPose(sp, ref); } catch (_) {}
+    if (!pose && frame.getJointPose) { try { pose = frame.getJointPose(sp, ref); } catch (_) {} }
+    if (pose) p[k] = v3(pose.transform.position);
+  }
+  if (!p.lsh || !p.rsh) return null;
+  return { hips: p.hips, chest: p.chest, neck: p.neck, lsh: p.lsh, rsh: p.rsh,
+           l: p.lel && p.lwr ? { sh: p.lsh, el: p.lel, wr: p.lwr } : null,
+           r: p.rel && p.rwr ? { sh: p.rsh, el: p.rel, wr: p.rwr } : null };
+}
+// Whole-arm mode jumps straight to your arm's pose, so each grab starts slow.
+const SOFT_MS = 1500, SOFT_VEL = 0.25;
+const grabAt = { l: -1e9, r: -1e9 };
 const q4 = (o) => [o.x, o.y, o.z, o.w];
 let placed = false, lastHudDraw = 0;
 
@@ -392,7 +446,9 @@ function onXRFrame(t, frame) {
   if (headQ && !placed) { core.recenter(headQ); placeWorld(headP); placed = true; }
 
   const inp = { q26: latest && latest.q ? latest.q : null,
-                qcmd: engaged && latest ? latest.q_cmd : null, head: headQ, l: null, r: null };
+                qcmd: engaged && latest ? latest.q_cmd : null, head: headQ, l: null, r: null,
+                body: readBody(frame, ref) };
+  if (!!inp.body !== hud.body) { hud.body = !!inp.body; hud.dirty = true; }
   let anyGrip = false;
   for (const src of frame.session.inputSources) {
     const side = src.handedness === "left" ? "l" : src.handedness === "right" ? "r" : null;
@@ -427,7 +483,7 @@ function onXRFrame(t, frame) {
       handColor[side] = !active ? COLOR[side]
         : core.blocked[side] ? COLOR.blocked : engaged ? COLOR.target : COLOR.preview;
       m.material.color.set(handColor[side]);
-      if (active && !hud.grip[side]) pulse(src, 0.3, 25);           // grabbed
+      if (active && !hud.grip[side]) { pulse(src, 0.3, 25); grabAt[side] = t; }   // grabbed
       if (hud.grip[side] !== active) { hud.grip[side] = active; hud.dirty = true; }
       inp[side] = { pos: v3(pose.transform.position), quat: q4(pose.transform.orientation), grip: active, src };
     }
@@ -447,7 +503,9 @@ function onXRFrame(t, frame) {
     if (out.warn.join() !== hud.warn.join()) { hud.warn = out.warn; hud.dirty = true; }
     // engaged + not frozen: stream (all-zero mask = heartbeat that feeds the watchdog)
     if (engaged && !frozen && t - lastSend >= SEND_MS) {
-      send({ type: "teleop", q: out.q.map((v) => +v.toFixed(4)), mask: out.mask, vel: speed() });
+      const soft = core.mode === "arm" && ["l", "r"].some((k) => hud.grip[k] && t - grabAt[k] < SOFT_MS);
+      send({ type: "teleop", q: out.q.map((v) => +v.toFixed(4)), mask: out.mask,
+             vel: soft ? Math.min(speed(), SOFT_VEL) : speed() });
       lastSend = t;
     }
     updateStage(inp, out, headP);
@@ -465,7 +523,7 @@ async function enterXR(mode) {
   readSettings();
   $("#xr-err").classList.add("hidden");
   try {
-    const session = await navigator.xr.requestSession(mode, { optionalFeatures: ["local-floor"] });
+    const session = await navigator.xr.requestSession(mode, { optionalFeatures: ["local-floor", "body-tracking"] });
     xrMode = mode;
     renderer.setClearColor(0x0c0e14, mode === "immersive-ar" ? 0 : 1);
     session.addEventListener("end", () => {
@@ -494,7 +552,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
   loadSettings();
   readSettings();
-  ["#opt-scale", "#opt-speed", "#opt-head", "#opt-arms"].forEach((s) => $(s).addEventListener("change", () => { readSettings(); hud.dirty = true; }));
+  ["#opt-scale", "#opt-speed", "#opt-head", "#opt-arms", "#opt-track"].forEach((s) => $(s).addEventListener("change", () => { readSettings(); hud.dirty = true; }));
   $("#btn-ar").addEventListener("click", () => enterXR("immersive-ar"));
   $("#btn-vr").addEventListener("click", () => enterXR("immersive-vr"));
   if (!navigator.xr) {

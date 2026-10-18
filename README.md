@@ -70,6 +70,11 @@ Drive both arms by hand from a Quest, in passthrough so you can see the robot.
    self-signed certificate (Advanced → Proceed). Pick the hand scale and speed,
    then tap **Enter passthrough**.
 
+**Tracking** (page setting): **Hand** moves the robot hand to follow your
+hand. **Whole arm** uses Quest body tracking: while you hold a grip, the robot
+arm copies the shape of your whole arm (upper arm and forearm). Each grab
+starts slowly. Allow body tracking if the browser asks.
+
 | Control | Action |
 |---|---|
 | Hold **grip** | That robot arm follows your hand, relative to where you grabbed. Twist to roll the wrist. Let go and the arm holds. |
